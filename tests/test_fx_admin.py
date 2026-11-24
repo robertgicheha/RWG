@@ -161,6 +161,44 @@ def test_candles_endpoint_and_runner_export(client, tmp_path_factory):
     assert len(r["bars"]) == 10 and r["positions"][0]["sl"] == 1.05
 
 
+def test_running_stats_total_and_win_rate_after_each_trade():
+    from core.fx_trend_analytics import running_stats
+    ts = [trade(1, 10), trade(2, -4), trade(3, 0), trade(4, 6)]
+    for i, t in enumerate(ts, 1):
+        t["close_time"] = f"2026-03-{i:02d}T00:00:00"
+    r = running_stats(list(reversed(ts)))                    # input order must not matter
+    assert [x["cum_pnl"] for x in r] == [10, 6, 6, 12]
+    assert [x["win_rate_pct"] for x in r] == [100.0, 50.0, 33.3, 50.0]      # break-even is not a win
+    assert [x["n"] for x in r] == [1, 2, 3, 4] and r[-1]["wins"] == 2
+
+
+def test_trades_endpoint_newest_first_with_totals(client):
+    c, root = client
+    ts = [trade(i, p) for i, p in enumerate([10, -4, 6], 1)]
+    for i, t in enumerate(ts, 1):
+        t["close_time"] = f"2026-03-{i:02d}T00:00:00"
+    Journal(root / "data/fx_trend.db").upsert_trades(ts)
+    rows = c.get("/api/trades", headers=H).json()["trades"]
+    assert rows[0]["cum_pnl"] == 12 and rows[0]["win_rate_pct"] == 66.7 and rows[-1]["n"] == 1
+
+
+def test_runner_announces_closed_trade_with_totals(tmp_path):
+    from datetime import datetime, timezone
+    from core.fx_trend_runner import FxTrendRunner, RunnerConfig
+    from tests.test_fx_trend_runner import FakeBroker, bars
+    now = datetime(2026, 3, 4, tzinfo=timezone.utc)
+    t = lambda k, p, d: {**trade(k, p), "close_time": f"2026-03-{d:02d}T10:00:00"}    # noqa: E731
+    b = FakeBroker({"EURUSD": bars()})
+    b.closed_trades = lambda since: [t(1, 10, 2), t(2, -4, 3)]
+    rn = FxTrendRunner(b, RunnerConfig(pairs=["EURUSD"], dry_run=False), base_dir=tmp_path)
+    rn.sync_trades(now, force=True)
+    msgs = [e["message"] for e in rn.journal.events() if e["kind"] == "trade"]
+    assert any("total made +6.00" in m and "win rate 50.0% (1/2)" in m for m in msgs)
+    assert any("total made +10.00" in m and "win rate 100.0% (1/1)" in m for m in msgs)
+    rn.sync_trades(now, force=True)                          # already known: no duplicate announcements
+    assert len([e for e in rn.journal.events(50) if e["kind"] == "trade"]) == 2
+
+
 def test_runner_writes_candles(tmp_path):
     from core.fx_trend_runner import FxTrendRunner, RunnerConfig
     from tests.test_fx_trend_runner import FakeBroker, NOW, bars

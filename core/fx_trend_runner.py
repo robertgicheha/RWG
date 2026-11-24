@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-from core.fx_trend_analytics import flip_analysis, signal_levels, strength
+from core.fx_trend_analytics import flip_analysis, running_stats, signal_levels, strength
 from core.fx_trend_broker import Broker, Position
 from core.fx_trend_journal import Journal
 from strategy.fx_risk import (
@@ -150,11 +150,26 @@ class FxTrendRunner:
         self._last_trade_sync = now
         try:
             trades = self.broker.closed_trades(now - timedelta(days=400))
+            known = {t["ticket"] for t in self.journal.trades(5000)}
             self.journal.upsert_trades(trades)
+            self._announce_closed([t for t in trades if t["ticket"] not in known], now)
             return len(trades)
         except Exception:
             logger.exception("trade sync failed")
             return 0
+
+    def _announce_closed(self, new: list[dict], now: datetime) -> None:
+        """After each newly closed trade: its P&L, total money made so far, and win rate."""
+        if not new:
+            return
+        fresh = {t["ticket"] for t in new
+                 if (t.get("close_time") or "") >= (now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")}
+        for r in running_stats(self.journal.trades(5000)):       # oldest first
+            if r["ticket"] in fresh:
+                self._act("trade", r["pair"],
+                          f"TRADE CLOSED {r['pair']} {'BUY' if r['side'] > 0 else 'SELL'} net {r['net']:+.2f} "
+                          f"| total made {r['cum_pnl']:+.2f} | win rate {r['win_rate_pct']:.1f}% "
+                          f"({r['wins']}/{r['n']})")
 
     def tick(self, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)

@@ -100,6 +100,23 @@ def _dt(s: str | None):
         return None
 
 
+def net_of(t: dict) -> float:
+    return t["profit"] + (t.get("commission") or 0) + (t.get("swap") or 0)
+
+
+def running_stats(trades: list[dict]) -> list[dict]:
+    """Closed trades oldest-first, each with the totals *after* that trade:
+    net, cum_pnl (money made so far), n, wins, win_rate_pct (win = net > 0)."""
+    out, cum, wins = [], 0.0, 0
+    for i, t in enumerate(sorted(trades, key=lambda t: (t.get("close_time") or "", t.get("ticket") or 0)), 1):
+        n = net_of(t)
+        cum += n
+        wins += n > 0
+        out.append({**t, "net": round(n, 2), "cum_pnl": round(cum, 2), "n": i, "wins": wins,
+                    "win_rate_pct": round(100 * wins / i, 1)})
+    return out
+
+
 def performance(trades: list[dict], equity: list[dict]) -> dict:
     """trades: journal rows (profit/commission/swap already in account currency)."""
     out: dict = {"n_trades": len(trades)}

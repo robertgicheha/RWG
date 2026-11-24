@@ -30,7 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from core.fx_trend_analytics import performance, project_equity
+from core.fx_trend_analytics import performance, project_equity, running_stats
 from core.fx_trend_journal import Journal
 from core.fx_trend_supervisor import BotSupervisor
 
@@ -152,7 +152,9 @@ def create_app(root: Path | str = ROOT, token: str | None = None) -> FastAPI:
 
     @app.get("/api/trades", dependencies=protected)
     def trades(limit: int = Query(500, le=5000)):
-        return {"trades": journal.trades(limit)}
+        # Newest first, each row carrying the running total and win rate as of that trade.
+        rows = running_stats(journal.trades(5000))
+        return {"trades": rows[::-1][:limit]}
 
     @app.get("/api/signals", dependencies=protected)
     def signals(pair: str | None = None):

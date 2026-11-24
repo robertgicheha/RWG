@@ -82,6 +82,7 @@ td.pl span{display:inline-flex;gap:5px;align-items:center;font-weight:600}
 /* position cards */
 .pcards{grid-template-columns:repeat(auto-fill,minmax(280px,1fr));margin-bottom:12px}
 .pcard{border-left:4px solid var(--flat)}.pcard.pos{border-left-color:var(--good)}.pcard.neg{border-left-color:var(--bad)}
+.card.pcard{color:var(--text)}
 .pcard .hd{display:flex;align-items:center;gap:10px}
 .pcard .big{margin-left:auto;font-size:20px;font-weight:700;display:flex;gap:6px;align-items:center}
 .kv{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;margin-top:10px;font-size:12px;color:var(--mute)}.kv b{color:var(--text);font-weight:600;float:right;font-variant-numeric:tabular-nums}
@@ -150,7 +151,10 @@ button.danger{border-color:var(--bad);color:var(--bad)}button.ok{border-color:va
 <section id="t-positions"><div class="grid pcards" id="pcards"></div>
   <div class="card"><h3><span data-i="layers"></span> Open positions (this bot only)</h3><div class="scroll" id="tb-pos"></div><p class="note" id="pos-note"></p></div></section>
 
-<section id="t-trades"><div class="card"><h3><span data-i="check"></span> Closed trades</h3>
+<section id="t-trades">
+  <div class="grid kpis" id="k-trades"></div>
+  <div class="card" style="margin-bottom:12px"><h3><span data-i="trend"></span> Total money made, after each trade</h3><canvas id="c-cum"></canvas></div>
+  <div class="card"><h3><span data-i="check"></span> Closed trades</h3>
   <div class="row"><select id="tr-pair"><option value="">All pairs</option></select></div>
   <div class="scroll" id="tb-trades"></div></div></section>
 
@@ -475,11 +479,20 @@ async function rTrades() {
   drawTrades();
 }
 function drawTrades() {
-  const f = $("#tr-pair").value, rows = TRADES.filter(t=>!f||t.pair===f), net = t => t.profit+(t.commission||0)+(t.swap||0);
+  const f = $("#tr-pair").value, rows = TRADES.filter(t=>!f||t.pair===f);
+  const last = TRADES[0];                                    // newest trade carries the all-time totals
+  $("#k-trades").replaceChildren(
+    kpi("Total money made", last ? fmt(last.cum_pnl) : "0.00", "after "+(last?last.n:0)+" closed trades", last ? last.cum_pnl : 0, "coins"),
+    kpi("Win rate", last ? fmt(last.win_rate_pct,1)+"%" : "-", last ? last.wins+" wins / "+last.n+" trades" : "no closed trades yet", last ? last.win_rate_pct-50 : null, "target"),
+    kpi("Last trade", last ? fmt(last.net) : "-", last ? last.pair+" "+(last.side>0?"BUY":"SELL") : "", last ? last.net : null, "check"));
+  const chron = [...TRADES].reverse();
+  lineChart($("#c-cum"), chron.map(t=>(t.close_time||"").slice(0,10)), [{name:"total made",values:chron.map(t=>t.cum_pnl),color:colors().accent}], {zero:true, area:true});
   $("#tb-trades").replaceChildren(table([
-    {h:"Pair",f:r=>r.pair},{h:"Side",f:r=>r.side>0?"BUY":"SELL",cls:r=>r.side>0?"pos":"neg",pl:r=>r.side},{h:"Lots",f:r=>r.volume},
-    {h:"Entry",f:r=>fmt(r.entry,5)},{h:"Exit",f:r=>fmt(r.exit,5)},{h:"Net P&L",f:r=>fmt(net(r)),pl:r=>net(r)},
-    {h:"Opened",f:r=>when(r.open_time)},{h:"Closed",f:r=>when(r.close_time)}], rows));
+    {h:"#",f:r=>r.n},{h:"Pair",f:r=>r.pair},{h:"Side",f:r=>r.side>0?"BUY":"SELL",cls:r=>r.side>0?"pos":"neg",pl:r=>r.side},{h:"Lots",f:r=>r.volume},
+    {h:"Entry",f:r=>fmt(r.entry,5)},{h:"Exit",f:r=>fmt(r.exit,5)},{h:"Net P&L",f:r=>fmt(r.net),pl:r=>r.net},
+    {h:"Total made",f:r=>fmt(r.cum_pnl),pl:r=>r.cum_pnl},
+    {h:"Win rate",f:r=>fmt(r.win_rate_pct,1)+"% ("+r.wins+"/"+r.n+")",pl:r=>r.win_rate_pct-50},
+    {h:"Closed",f:r=>when(r.close_time)}], rows));
 }
 async function rSignals() {
   const d = await api("/api/signals"), cw = await api("/api/candles"), px = Object.fromEntries(cw.watch.map(w=>[w.pair,w]));
