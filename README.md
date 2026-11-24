@@ -14,7 +14,7 @@ python -m venv .venv && .venv\Scripts\activate      # Windows (MetaTrader5 packa
 pip install -r requirements.txt
 cp .env.example .env                                  # set FX_ADMIN_TOKEN, MT5_* creds
 
-python scripts/run_fx_trend_backtest.py --csv-dir <dir> --holdout-start 2022-01-01
+python scripts/export_mt5_history.py --out data/fx_daily\npython scripts/run_fx_trend_backtest.py --csv-dir data/fx_daily --holdout-start 2022-01-01 --walk-forward
 python -m dashboard.fx_admin                          # http://127.0.0.1:8090
 python scripts/run_fx_trend_bot.py                    # dry-run
 pytest

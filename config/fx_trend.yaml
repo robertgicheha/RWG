@@ -13,6 +13,9 @@ fx_trend:
     atr_stop_mult: 3.0
     risk_pct: 0.5          # % of equity lost if a stop is hit
     allow_short: true
+    # Whipsaw filters: OFF until `run_fx_trend_backtest.py --walk-forward` says they help.
+    min_entry_strength_atr: 0.0   # open only if |close-SMA| >= this many ATRs
+    cooldown_days: 0              # wait N days to re-enter a pair after a losing close
 
   risk:
     max_open_positions: 6

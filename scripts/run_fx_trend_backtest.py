@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--risk-pct", type=float, default=0.5)
     ap.add_argument("--holdout-start", default=None, help="YYYY-MM-DD; judge on data from here on")
     ap.add_argument("--no-grid", action="store_true")
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="rolling re-optimisation (4y train / 1y test); compares baseline vs whipsaw filters")
     args = ap.parse_args()
 
     if args.csv_dir:
@@ -146,6 +148,23 @@ def main():
                                                  risk_pct=args.risk_pct), base)["stats"]
             report["sensitivity"].append({"sma": sma, "mom": mom, "atr_mult": mult, **r})
             print(f"  {sma:>3}/{mom:>3}/{mult}: CAGR {r.get('cagr_pct')}%  DD {r.get('max_drawdown_pct')}%  trades {r.get('n_trades')}")
+
+    if args.walk_forward:
+        from strategy.fx_trend_walkforward import compare
+        print("\n=== Walk-forward (4y train -> 1y unseen test, rolling) ===  this takes a few minutes")
+        wf = compare(frames, base, p)
+        report["walk_forward"] = wf
+        for name in ("baseline", "with_filters"):
+            w = wf[name]
+            if not w.get("ok"):
+                print(f"  {name}: {w.get('reason')}")
+                continue
+            o = w["oos"]
+            print(f"  {name:13s} OOS return {o.get('total_return_pct')}%  maxDD {o.get('max_drawdown_pct')}%  "
+                  f"Sharpe {o.get('sharpe')}  folds profitable {w['profitable_folds']}/{w['n_folds']}  "
+                  f"efficiency {w['efficiency']}  param-stability {w['stability']['share']:.0%} "
+                  f"({w['stability']['distinct_choices']} distinct)")
+        print(f"  verdict: {wf['verdict']}")
 
     out = ROOT / "data" / "fx_trend_backtest.json"
     out.parent.mkdir(parents=True, exist_ok=True)

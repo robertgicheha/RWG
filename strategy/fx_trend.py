@@ -33,6 +33,10 @@ class TrendParams:
     risk_pct: float = 0.5          # % of equity lost if the initial stop is hit
     allow_short: bool = True
     max_leverage_per_pos: float = 5.0   # cap on notional / equity for one position
+    # Whipsaw controls. Both default OFF, so behaviour is unchanged until a
+    # walk-forward test (strategy/fx_trend_walkforward.py) shows they help.
+    min_entry_strength_atr: float = 0.0  # open only if |close - SMA| >= this many ATRs (holding is unaffected)
+    cooldown_days: int = 0               # after a LOSING close, don't re-enter that pair for N calendar days
 
     @property
     def warmup(self) -> int:
@@ -52,10 +56,11 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.DataFrame:
-    """Return a copy with sma, mom, atr and signal (+1/-1/0) columns.
+    """Return a copy with sma, mom, atr, strength, signal (+1/-1/0) and entry_ok.
 
     signal[t] depends only on bars <= t (no look-ahead). It is NaN-safe: during
-    warm-up the signal is 0.
+    warm-up the signal is 0. `signal` decides what to HOLD; `entry_ok` is the
+    extra condition for OPENING a new position (see min_entry_strength_atr).
     """
     out = df.copy()
     out["sma"] = out["close"].rolling(p.sma_len, min_periods=p.sma_len).mean()
@@ -66,6 +71,8 @@ def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.D
     short_ = (out["close"] < out["sma"]) & (out["mom"] < 0) if p.allow_short else False
     sig = np.where(long_, 1, np.where(short_, -1, 0))
     out["signal"] = pd.Series(sig, index=out.index).where(out[["sma", "mom", "atr"]].notna().all(axis=1), 0).astype(int)
+    out["strength"] = (out["close"] - out["sma"]) / out["atr"]
+    out["entry_ok"] = (out["signal"] != 0) & (out["strength"].abs() >= p.min_entry_strength_atr)
     return out
 
 

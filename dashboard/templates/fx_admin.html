@@ -362,6 +362,18 @@ async function rBacktest() {
     el("div",{class:"card"},[el("h3",{text:"Monte Carlo"}),table([{h:"",f:r=>r[0]},{h:"",f:r=>r[1]}],Object.entries(mc))]),
     el("div",{class:"card"},[el("h3",{text:"Parameter sensitivity"}),el("div",{class:"scroll"},table([{h:"SMA/Mom/ATRx",f:r=>r.sma+"/"+r.mom+"/"+r.atr_mult},{h:"CAGR %",f:r=>r.cagr_pct,cls:r=>sgn(r.cagr_pct)},{h:"Max DD %",f:r=>r.max_drawdown_pct},{h:"Trades",f:r=>r.n_trades}], d.sensitivity||[])),
       el("p",{class:"note",text:"If only one row is profitable the edge is fragile. In-sample: "+JSON.stringify(d.in_sample||{})})])]));
+  const wf = d.walk_forward;
+  if (wf) {
+    const row = (name, w) => w && w.ok ? [name, pct(w.oos.total_return_pct), fmt(w.oos.max_drawdown_pct)+"%", w.oos.sharpe, w.profitable_folds+"/"+w.n_folds, w.efficiency ?? "-",
+      Math.round(w.stability.share*100)+"% ("+w.stability.distinct_choices+" distinct)"] : [name, w ? w.reason : "-", "", "", "", "", ""];
+    const folds = (wf.with_filters && wf.with_filters.ok ? wf.with_filters : wf.baseline).folds || [];
+    box.append(el("div",{class:"card",style:"margin-top:12px"},[el("h3",{text:"Walk-forward (out-of-sample is the number to trust)"}),
+      el("div",{class:"scroll"},table([{h:"Grid",f:r=>r[0]},{h:"OOS return",f:r=>r[1]},{h:"Max DD",f:r=>r[2]},{h:"Sharpe",f:r=>r[3]},{h:"Profitable folds",f:r=>r[4]},{h:"Efficiency",f:r=>r[5]},{h:"Param stability",f:r=>r[6]}],
+        [row("Baseline", wf.baseline), row("With whipsaw filters", wf.with_filters)])),
+      el("p",{class:"note",text:"Verdict: "+wf.verdict+". Efficiency = OOS Sharpe / in-sample Sharpe (near 1 healthy, below ~0.5 means curve-fitting)."}),
+      el("div",{class:"scroll"},table([{h:"Test window",f:r=>r.test[0]+" → "+r.test[1]},{h:"Chosen params",f:r=>r.params},{h:"In-sample Sharpe",f:r=>r.is_sharpe},
+        {h:"OOS return",f:r=>pct(r.oos.total_return_pct),cls:r=>sgn(r.oos.total_return_pct)},{h:"OOS max DD",f:r=>fmt(r.oos.max_drawdown_pct)+"%"},{h:"Trades",f:r=>r.oos.n_trades}], folds))]));
+  }
 }
 async function rLogs() {
   const q = new URLSearchParams({file:$("#lg-file").value, lines:$("#lg-n").value, q:$("#lg-q").value, level:$("#lg-level").value});

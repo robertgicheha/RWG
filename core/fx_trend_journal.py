@@ -102,6 +102,16 @@ class Journal:
     def trades(self, limit: int = 1000) -> list[dict]:
         return self._rows("SELECT * FROM trades ORDER BY close_time DESC LIMIT ?", (limit,))
 
+    def last_loss_close(self, pair: str) -> datetime | None:
+        """Close time of this pair's most recent LOSING trade (net of commission and swap)."""
+        rows = self._rows("SELECT close_time FROM trades WHERE pair=? AND "
+                          "profit + COALESCE(commission,0) + COALESCE(swap,0) < 0 "
+                          "ORDER BY close_time DESC LIMIT 1", (pair,))
+        try:
+            return datetime.fromisoformat(rows[0]["close_time"]) if rows else None
+        except (ValueError, TypeError):
+            return None
+
     def latest_signals(self) -> list[dict]:
         return self._rows("SELECT * FROM signals WHERE bar=(SELECT MAX(bar) FROM signals) ORDER BY pair")
 

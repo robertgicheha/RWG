@@ -32,3 +32,20 @@ No strategy is guaranteed to profit. Validate on a demo account first.
 
 ## Tests
 `pytest tests/test_fx_trend.py tests/test_fx_trend_runner.py tests/test_fx_admin.py`
+
+## Validating the strategy honestly
+1. Export real history from the broker you will trade:
+   `python scripts/export_mt5_history.py --out data/fx_daily --bars 5000`
+2. Backtest with a holdout and walk-forward:
+   `python scripts/run_fx_trend_backtest.py --csv-dir data/fx_daily --holdout-start 2022-01-01 --walk-forward`
+   - **Holdout:** look at it once; re-tuning afterwards makes it in-sample.
+   - **Walk-forward:** re-optimises on 4 years, tests on the next unseen year, rolling. Read the
+     out-of-sample numbers, the *efficiency* (OOS/in-sample Sharpe; below ~0.5 = curve-fitting) and
+     *parameter stability* (a winner that changes every fold means no real edge).
+   - It compares the baseline grid against one with the whipsaw filters on the same folds.
+3. Only if the filters win out-of-sample, enable them in `config/fx_trend.yaml`
+   (`min_entry_strength_atr`, `cooldown_days`). They are OFF by default.
+
+## One source of truth for risk rules
+`strategy/fx_risk.py` holds the entry gates (max positions, per-currency exposure cap, daily/weekly
+loss halts, cooldown). The backtest and the live runner both call it, so they cannot drift apart.

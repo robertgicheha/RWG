@@ -31,6 +31,9 @@ from typing import Callable
 from core.fx_trend_analytics import flip_analysis, signal_levels, strength
 from core.fx_trend_broker import Broker, Position
 from core.fx_trend_journal import Journal
+from strategy.fx_risk import (
+    RiskLimits, entry_block_reason, halt_reason, in_cooldown, net_exposure,
+)
 from strategy.fx_trend import (
     TrendParams, compute_indicators, currency_legs, initial_stop, trail_stop,
 )
@@ -202,10 +205,13 @@ class FxTrendRunner:
         prev_eq = state.get("prev_equity", equity)
         daily_pct = (equity / prev_eq - 1) * 100 if prev_eq else 0.0
         weekly_pct = (equity / state["week_start_equity"] - 1) * 100 if state.get("week_start_equity") else 0.0
-        halted = daily_pct <= -cfg.daily_loss_halt_pct or weekly_pct <= -cfg.weekly_loss_halt_pct
+        limits = RiskLimits(cfg.max_open_positions, cfg.max_net_per_currency,
+                            cfg.daily_loss_halt_pct, cfg.weekly_loss_halt_pct)
+        why_halted = halt_reason(daily_pct, weekly_pct, limits)
+        halted = why_halted is not None
         self._halted = halted
         if halted:
-            msg = f"entries HALTED (day {daily_pct:.2f}%, week {weekly_pct:.2f}%)"
+            msg = f"entries HALTED: {why_halted}"
             self.notify("FX trend bot: " + msg)
             self._event("halt", msg, level="WARNING")
 
@@ -251,11 +257,9 @@ class FxTrendRunner:
             remaining.append(pos)
 
         # ---- 2. entries ----------------------------------------------------
-        open_pairs = {pos.pair for pos in remaining}
-        net: dict[str, int] = {}
-        for pos in remaining:
-            for c, s in currency_legs(pos.pair, pos.side).items():
-                net[c] = net.get(c, 0) + s
+        open_list = [(pos.pair, pos.side) for pos in remaining]
+        open_pairs = {pair for pair, _ in open_list}
+        net = net_exposure(open_list)
 
         def skip(pair, why):
             logger.info("%s skipped: %s", pair, why)
@@ -266,13 +270,18 @@ class FxTrendRunner:
                 want = int(row["signal"])
                 if want == 0 or pair in open_pairs:
                     continue
-                if len(open_pairs) >= cfg.max_open_positions:
-                    skip(pair, "max open positions reached")
+                if not bool(row["entry_ok"]):
+                    skip(pair, f"signal too weak ({row['strength']:+.2f} ATR < "
+                               f"{p.min_entry_strength_atr} required)")
+                    continue
+                if in_cooldown(self.journal.last_loss_close(pair), now, p.cooldown_days):
+                    skip(pair, f"cooling down after a loss ({p.cooldown_days}d)")
+                    continue
+                blocked = entry_block_reason(pair, want, open_list, limits, net)
+                if blocked:
+                    skip(pair, blocked)
                     continue
                 legs = currency_legs(pair, want)
-                if any(abs(net.get(c, 0) + s) > cfg.max_net_per_currency for c, s in legs.items()):
-                    skip(pair, "currency exposure cap")
-                    continue
                 q = self.broker.quote(pair)
                 if q is None:
                     skip(pair, "no quote")
@@ -295,6 +304,7 @@ class FxTrendRunner:
                     continue
                 summary["actions"].append(("open", pair))
                 open_pairs.add(pair)
+                open_list.append((pair, want))
                 for c, s in legs.items():
                     net[c] = net.get(c, 0) + s
 
