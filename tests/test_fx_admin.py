@@ -147,6 +147,28 @@ def test_data_flows_to_dashboard(client):
     assert pred["projection"]["ok"] and pred["currency_net"] == {"EUR": 1, "USD": -1}
 
 
+def test_candles_endpoint_and_runner_export(client, tmp_path_factory):
+    c, root = client
+    assert c.get("/api/candles", headers=H).json() == {"watch": []}              # empty before the first cycle
+    assert c.get("/api/candles?pair=EURUSD", headers=H).status_code == 404
+    bars = [{"d": f"2026-03-{i + 1:02d}", "o": 1.1, "h": 1.12, "l": 1.09, "c": 1.1 + i / 1000, "sma": 1.1} for i in range(12)]
+    (root / "data/fx_trend_candles.json").write_text(json.dumps({"EURUSD": bars}))
+    (root / "data/fx_trend_snapshot.json").write_text(json.dumps(
+        {"positions": [{"pair": "EURUSD", "side": 1, "entry": 1.1, "sl": 1.05, "profit": 1.0}]}))
+    w = c.get("/api/candles", headers=H).json()["watch"][0]
+    assert w["pair"] == "EURUSD" and w["chg_pct"] > 0 and len(w["spark"]) == 12
+    r = c.get("/api/candles?pair=EURUSD&n=10", headers=H).json()
+    assert len(r["bars"]) == 10 and r["positions"][0]["sl"] == 1.05
+
+
+def test_runner_writes_candles(tmp_path):
+    from core.fx_trend_runner import FxTrendRunner, RunnerConfig
+    from tests.test_fx_trend_runner import FakeBroker, NOW, bars
+    FxTrendRunner(FakeBroker({"EURUSD": bars()}), RunnerConfig(pairs=["EURUSD"]), base_dir=tmp_path).run_once(NOW)
+    data = json.loads((tmp_path / "data/fx_trend_candles.json").read_text())
+    assert set(data["EURUSD"][-1]) == {"d", "o", "h", "l", "c", "sma"} and len(data["EURUSD"]) <= 150
+
+
 def test_logs_tail_and_filter(client):
     c, root = client
     d = root / "data/logs"; d.mkdir(parents=True)

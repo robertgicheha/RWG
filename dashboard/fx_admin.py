@@ -160,6 +160,25 @@ def create_app(root: Path | str = ROOT, token: str | None = None) -> FastAPI:
             return {"pair": pair, "history": journal.signal_history(pair)}
         return {"signals": journal.latest_signals()}
 
+    @app.get("/api/candles", dependencies=protected)
+    def candles(pair: str | None = None, n: int = Query(120, ge=10, le=150)):
+        """Daily OHLC + SMA written by the bot each cycle. Without `pair`: market-watch summary."""
+        data = _read_json(root / "data" / "fx_trend_candles.json", {}) or {}
+        snap = _read_json(root / "data" / "fx_trend_snapshot.json", {}) or {}
+        if pair:
+            if pair not in data:
+                raise HTTPException(404, f"no candles for {pair}")
+            pos = [p for p in snap.get("positions", []) if p["pair"] == pair]
+            return {"pair": pair, "bars": data[pair][-n:], "positions": pos}
+        watch = []
+        for sym, bars in data.items():
+            if len(bars) < 2:
+                continue
+            last, prev = bars[-1]["c"], bars[-2]["c"]
+            watch.append({"pair": sym, "last": last, "chg_pct": (last / prev - 1) * 100 if prev else 0.0,
+                          "spark": [b["c"] for b in bars[-30:]]})
+        return {"watch": watch}
+
     @app.get("/api/analysis", dependencies=protected)
     def analysis():
         return performance(journal.trades(5000), journal.equity_series(5000))

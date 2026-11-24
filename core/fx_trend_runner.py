@@ -165,6 +165,24 @@ class FxTrendRunner:
             logger.exception("snapshot/sync failed")
         return self.run_once(now)
 
+    def _write_candles(self, inds: dict, n: int = 150) -> None:
+        """Recent daily OHLC + SMA per pair for the dashboard's candlestick charts."""
+        try:
+            out = {}
+            for pair, ind in inds.items():
+                t = ind.tail(n)
+                out[pair] = [{"d": i.strftime("%Y-%m-%d"), "o": float(r["open"]), "h": float(r["high"]),
+                              "l": float(r["low"]), "c": float(r["close"]),
+                              "sma": None if r["sma"] != r["sma"] else float(r["sma"])}
+                             for i, r in t.iterrows()]
+            path = self.base / "data" / "fx_trend_candles.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(out))
+            tmp.replace(path)
+        except Exception:
+            logger.exception("candle export failed")
+
     # ------------------------------------------------------------------
     def run_once(self, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
@@ -230,7 +248,9 @@ class FxTrendRunner:
             self.notify("FX trend bot: " + msg)
             self._event("halt", msg, level="WARNING")
 
-        rows = {pair: compute_indicators(df, p).iloc[-1] for pair, df in frames.items()}
+        inds = {pair: compute_indicators(df, p) for pair, df in frames.items()}
+        rows = {pair: ind.iloc[-1] for pair, ind in inds.items()}
+        self._write_candles(inds)
 
         # ---- journal the analysis for the dashboard ------------------------
         sig_rows = []

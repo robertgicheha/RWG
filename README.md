@@ -10,7 +10,10 @@ See [docs/FX_TREND_BOT.md](docs/FX_TREND_BOT.md) for the file map, workflow and 
 
 ## Quick start
 ```bash
-python -m venv .venv && .venv\Scripts\activate      # Windows (MetaTrader5 package is Windows-only)
+# First time only (Windows; the MetaTrader5 package is Windows-only). Skip if .venv already exists:
+# if you see "Permission denied ... python.exe" the venv is already active/in use - don't recreate it.
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env                                  # set FX_ADMIN_TOKEN, MT5_* creds
 
