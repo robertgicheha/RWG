@@ -336,6 +336,7 @@ class FxTrendRunner:
                 if not cfg.dry_run and self.broker.open(pair, want, lots, stop) is None:
                     self.notify(f"FX trend bot: ORDER FAILED {pair}")
                     self._event("order", f"OPEN FAILED {pair}", pair, "ERROR")
+                    summary.setdefault("failed", []).append(pair)
                     continue
                 summary["actions"].append(("open", pair))
                 open_pairs.add(pair)
@@ -346,8 +347,14 @@ class FxTrendRunner:
         # ---- persist ------------------------------------------------------
         self.journal.add_cycle(latest_bar, equity, daily_pct, weekly_pct, halted, len(open_pairs),
                                "halted" if halted else "ok")
-        state.update(last_bar=latest_bar, prev_equity=equity,
-                     last_run=now.isoformat(timespec="seconds"))
+        # A failed order (e.g. AutoTrading switched off in MT5) must not consume the bar:
+        # leave last_bar unset so the next poll retries. Already-open pairs are not re-sent.
+        state.update(prev_equity=equity, last_run=now.isoformat(timespec="seconds"))
+        if not summary.get("failed"):
+            state["last_bar"] = latest_bar
+        else:
+            state.pop("last_bar", None)
+            summary["retry"] = True
         _save(state_path, state)
         self.sync_trades(now, force=True)
         summary["equity"] = equity

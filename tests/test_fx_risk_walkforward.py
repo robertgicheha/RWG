@@ -164,6 +164,21 @@ def test_runner_sizes_off_reinvest_rule_and_tracks_profit(tmp_path):
     assert cap["profit"] == 2000 and cap["reinvested"] == 1000 and cap["banked"] == 1000
 
 
+def test_failed_order_does_not_consume_the_bar(tmp_path):
+    class Rejecting(FakeBroker):
+        ok = False
+        def open(self, *a):
+            return super().open(*a) if self.ok else None
+    b = Rejecting({"EURUSD": bars()})
+    rn = FxTrendRunner(b, RunnerConfig(pairs=["EURUSD"], dry_run=False), base_dir=tmp_path)
+    r = rn.run_once(NOW)
+    assert r["failed"] == ["EURUSD"] and r["retry"]
+    assert "last_bar" not in json.loads((tmp_path / "data/fx_trend_state.json").read_text())
+    b.ok = True                                                        # e.g. user enabled AutoTrading
+    assert rn.run_once(NOW)["actions"] == [("open", "EURUSD")]
+    assert rn.run_once(NOW)["skipped"] == "already_processed"
+
+
 def test_starting_capital_defaults_to_first_equity(tmp_path):
     b = _RecordingBroker({"EURUSD": bars()}, equity=7_500)
     rn = FxTrendRunner(b, RunnerConfig(pairs=["EURUSD"], dry_run=False), base_dir=tmp_path)
