@@ -130,6 +130,8 @@ button.danger{border-color:var(--bad);color:var(--bad)}button.ok{border-color:va
 <section id="t-overview">
   <div id="banner"></div>
   <div class="grid kpis" id="k-over"></div>
+  <h3 class="mute" style="font-size:12px;letter-spacing:.05em;text-transform:uppercase;margin:4px 0 8px"><span data-i="award"></span> Trade scoreboard (updates after every closed trade)</h3>
+  <div class="grid kpis" id="k-score"></div>
   <h3 class="mute" style="font-size:12px;letter-spacing:.05em;text-transform:uppercase;margin:4px 0 8px"><span data-i="globe"></span> Market watch</h3>
   <div class="grid watch" id="watch"></div>
   <div class="card" style="margin-bottom:12px">
@@ -393,7 +395,7 @@ function showApp() { $("#login").hidden = true; $("#app").hidden = false; refres
 // ---------- renderers ----------
 let LAST_SIGS = {};
 async function rOverview() {
-  const [d, cw, sg] = await Promise.all([api("/api/overview"), api("/api/candles"), api("/api/signals")]);
+  const [d, cw, sg, tr] = await Promise.all([api("/api/overview"), api("/api/candles"), api("/api/signals"), api("/api/trades")]);
   const b = d.bot, s = d.snapshot||{}, a = s.account||{}, p = d.performance||{}, lc = d.last_cycle||{}, st = d.state||{}, cap = s.capital||{};
   LAST_SIGS = Object.fromEntries((sg.signals||[]).map(x=>[x.pair,x]));
   const pb = $("#p-bot"); pb.replaceChildren(el("span",{class:"dot"}), b.running ? (b.health==="healthy"?"BOT RUNNING":b.health==="starting"?"STARTING":"BOT UNRESPONSIVE") : "BOT STOPPED");
@@ -421,6 +423,15 @@ async function rOverview() {
     kpi("Net P&L (closed)", fmt(p.net_pnl||0), (p.n_trades||0)+" trades", p.net_pnl||0, "check"),
     kpi("Win rate", p.win_rate!=null ? fmt(p.win_rate*100,1)+"%" : "-", "profit factor "+(p.profit_factor??"-"), p.win_rate!=null ? p.win_rate-0.5 : null, "target"),
     kpi("Max drawdown", p.max_drawdown_pct!=null ? fmt(p.max_drawdown_pct)+"%" : "-", "now "+(p.current_drawdown_pct!=null?fmt(p.current_drawdown_pct)+"%":"-"), p.max_drawdown_pct ? -Math.abs(p.max_drawdown_pct) : 0, "shield"));
+  // trade scoreboard: totals after the most recent closed trade (+ the open trades on top)
+  const lt = tr.trades[0], nets = tr.trades.map(t=>t.net), lossN = nets.filter(x=>x<0).length, flatN = nets.filter(x=>x===0).length;
+  const floating = s.floating_pnl||0, made = lt ? lt.cum_pnl : 0, openN = (s.positions||[]).length;
+  $("#k-score").replaceChildren(
+    kpi("Total money made", fmt(made), lt ? "after "+lt.n+" closed trades" : "no closed trades yet", made, "coins"),
+    kpi("Made incl. open trades", fmt(made+floating), openN+" open · floating "+fmt(floating), made+floating, "wallet"),
+    kpi("Win rate", lt ? fmt(lt.win_rate_pct,1)+"%" : "-", lt ? lt.wins+" wins / "+lossN+" losses"+(flatN?" / "+flatN+" flat":"") : "waiting for the first close", lt ? lt.win_rate_pct-50 : null, "target"),
+    kpi("Last closed trade", lt ? fmt(lt.net) : "-", lt ? lt.pair+" "+(lt.side>0?"BUY":"SELL")+" · "+when(lt.close_time) : "none yet", lt ? lt.net : null, "check"),
+    kpi("Best / worst trade", lt ? fmt(Math.max(...nets))+" / "+fmt(Math.min(...nets)) : "-", "single closed trades", lt ? Math.max(...nets)+Math.min(...nets) : null, "award"));
   // market watch
   const wEl = $("#watch"); wEl.replaceChildren();
   cw.watch.forEach(w => {
