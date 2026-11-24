@@ -62,8 +62,9 @@ class Broker(Protocol):
 
 class MT5Broker:
     def __init__(self, magic: int, suffix: str = "", login: int = 0, password: str = "",
-                 server: str = "", deviation: int = 20):
+                 server: str = "", deviation: int = 20, terminal_path: str = ""):
         self.magic, self.suffix, self.deviation = magic, suffix, deviation
+        self.terminal_path = terminal_path   # pin to one terminal64.exe when several are installed
         self.login, self.password, self.server = login, password, server
 
     # -- helpers -----------------------------------------------------------
@@ -85,7 +86,8 @@ class MT5Broker:
     def connect(self) -> bool:
         try:
             mt5 = get_mt5()
-            if not mt5.initialize():
+            ok = mt5.initialize(self.terminal_path) if self.terminal_path else mt5.initialize()
+            if not ok:
                 logger.error("MT5 initialize failed: %s", mt5.last_error())
                 return False
             if self.login and not mt5.login(self.login, password=self.password, server=self.server):

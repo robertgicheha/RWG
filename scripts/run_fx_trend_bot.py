@@ -110,7 +110,8 @@ def main():
     broker = MT5Broker(
         magic=y["magic"], suffix=y.get("symbol_suffix", ""),
         login=int(os.environ.get("MT5_LOGIN", "0") or 0),
-        password=os.environ.get("MT5_PASSWORD", ""), server=os.environ.get("MT5_SERVER", ""))
+        password=os.environ.get("MT5_PASSWORD", ""), server=os.environ.get("MT5_SERVER", ""),
+        terminal_path=os.environ.get("MT5_TERMINAL_PATH", ""))
     if not broker.connect():
         log.error("MT5 connection failed.")
         sys.exit("MT5 connection failed.")
