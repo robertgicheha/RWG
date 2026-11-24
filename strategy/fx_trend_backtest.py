@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from strategy.fx_risk import (
-    RiskLimits, entry_block_reason, halt_reason, in_cooldown, net_exposure,
+    RiskLimits, entry_block_reason, halt_reason, in_cooldown, net_exposure, sizing_equity,
 )
 from strategy.fx_trend import (
     TrendParams, compute_indicators, currency_legs, initial_stop,
@@ -51,6 +51,7 @@ def pip_size(pair: str) -> float:
 @dataclass
 class BtConfig:
     initial_equity: float = 10_000.0
+    reinvest_pct: float = 100.0          # % of profit above initial equity that is reinvested in sizing
     slippage_pips: float = 0.3
     swap_bps_per_day: float = 0.3        # cost, per day per notional (calendar days held)
     spread_pips: dict = field(default_factory=lambda: dict(DEFAULT_SPREAD_PIPS))
@@ -190,7 +191,8 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
                 entry = _fill(bar["open"], want, pair, cfg)
                 stop = initial_stop(want, entry, atr_prev, p.atr_stop_mult)
                 eq = mark()
-                notional = position_notional(eq, p.risk_pct, entry, stop, p.max_leverage_per_pos)
+                notional = position_notional(sizing_equity(eq, cfg.initial_equity, cfg.reinvest_pct),
+                                             p.risk_pct, entry, stop, p.max_leverage_per_pos)
                 if notional <= 0:
                     continue
                 pos[pair] = dict(side=want, entry=entry, stop=stop, notional=notional,

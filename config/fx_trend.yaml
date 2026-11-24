@@ -17,6 +17,15 @@ fx_trend:
     min_entry_strength_atr: 0.0   # open only if |close-SMA| >= this many ATRs
     cooldown_days: 0              # wait N days to re-enter a pair after a losing close
 
+  capital:
+    # Compounding. Position size is always risk_pct of the *sizing equity*.
+    # reinvest_pct 100 = full compounding: every dollar of profit raises future position sizes
+    # (and drawdowns shrink them). Lower it to hold back part of the profit from risk, e.g. 50
+    # sizes off starting capital + half of the profit. The bot never moves money: banked profit
+    # stays in the account until YOU withdraw it at the broker.
+    reinvest_pct: 100
+    starting_capital: 0     # 0 = account equity when the bot first runs (set it if you top up)
+
   risk:
     max_open_positions: 6
     max_net_per_currency: 3   # blocks e.g. long EURUSD+GBPUSD+AUDUSD+NZDUSD (one USD bet)

@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, timezone
 
 import numpy as np
@@ -134,3 +135,45 @@ def test_compare_verdict_is_cautious(monkeypatch):
     assert "improved" in w.compare({"x": None})["verdict"]
     seq = iter([mk(0.5, 4), mk(0.2, 3)])
     assert "did NOT help" in w.compare({"x": None})["verdict"]
+
+
+# ---------------- compounding / profit reinvestment ----------------
+def test_sizing_equity_rules():
+    from strategy.fx_risk import sizing_equity
+    assert sizing_equity(12_000, 10_000, 100) == 12_000          # full compounding
+    assert sizing_equity(12_000, 10_000, 50) == 11_000           # half the profit held back
+    assert sizing_equity(12_000, 10_000, 0) == 10_000            # all profit banked
+    assert sizing_equity(9_000, 10_000, 0) == 9_000              # losses always shrink size
+    assert sizing_equity(12_000, 0, 50) == 12_000                # no starting capital known yet
+    assert sizing_equity(12_000, 10_000, 250) == 12_000          # clamped to 0..100
+
+
+class _RecordingBroker(FakeBroker):
+    def lots_for_risk(self, pair, side, risk_amount, entry, stop):
+        self.risk_amounts = getattr(self, "risk_amounts", []) + [risk_amount]
+        return 0.1
+
+
+def test_runner_sizes_off_reinvest_rule_and_tracks_profit(tmp_path):
+    b = _RecordingBroker({"EURUSD": bars()}, equity=12_000)
+    cfg = RunnerConfig(pairs=["EURUSD"], dry_run=False, reinvest_pct=50, starting_capital=10_000)
+    rn = FxTrendRunner(b, cfg, base_dir=tmp_path)
+    rn.run_once(NOW)
+    assert b.risk_amounts[0] == pytest.approx(11_000 * 0.5 / 100)    # 0.5% of 11,000, not of 12,000
+    cap = rn.snapshot(NOW)["capital"]
+    assert cap["profit"] == 2000 and cap["reinvested"] == 1000 and cap["banked"] == 1000
+
+
+def test_starting_capital_defaults_to_first_equity(tmp_path):
+    b = _RecordingBroker({"EURUSD": bars()}, equity=7_500)
+    rn = FxTrendRunner(b, RunnerConfig(pairs=["EURUSD"], dry_run=False), base_dir=tmp_path)
+    rn.run_once(NOW)
+    assert json.loads((tmp_path / "data/fx_trend_state.json").read_text())["starting_capital"] == 7_500
+
+
+def test_backtest_reinvest_zero_does_not_compound():
+    frames = {"EURUSD": regime_df(2000, seed=5)}
+    full = run_backtest(frames, TrendParams(), BtConfig(reinvest_pct=100))
+    flat = run_backtest(frames, TrendParams(), BtConfig(reinvest_pct=0))
+    assert full["stats"]["total_return_pct"] > 0                      # sanity: strategy profits on this data
+    assert full["stats"]["total_return_pct"] > flat["stats"]["total_return_pct"]

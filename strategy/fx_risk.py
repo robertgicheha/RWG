@@ -52,6 +52,20 @@ def entry_block_reason(pair: str, side: int, open_positions: list[tuple[str, int
     return None
 
 
+def sizing_equity(equity: float, starting_capital: float, reinvest_pct: float = 100.0) -> float:
+    """Equity the position sizer is allowed to risk against.
+
+    Profits above `starting_capital` are reinvested at `reinvest_pct` (100 = full
+    compounding, 0 = always size off the starting capital and treat all profit
+    as banked). Below starting capital, size off real equity: losses always
+    shrink position sizes, never the other way round.
+    """
+    if starting_capital <= 0 or equity <= starting_capital:
+        return equity
+    r = min(max(reinvest_pct, 0.0), 100.0) / 100.0
+    return starting_capital + r * (equity - starting_capital)
+
+
 def in_cooldown(last_loss_close: date | datetime | None, today: date | datetime,
                 cooldown_days: int) -> bool:
     """True if the pair closed at a loss less than `cooldown_days` ago."""

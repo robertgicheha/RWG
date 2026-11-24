@@ -268,6 +268,8 @@ async function rOverview() {
   // KPIs
   const k = $("#k-over"); k.replaceChildren(
     kpi("Equity", a.equity!=null ? fmt(a.equity)+" "+(a.currency||"") : "-", a.server ? a.server+" #"+a.login : "no snapshot"),
+    kpi("Profit vs start", s.capital && s.capital.starting_capital ? fmt(s.capital.profit) : "-",
+        s.capital ? "start "+fmt(s.capital.starting_capital)+" · reinvest "+s.capital.reinvest_pct+"% · banked "+fmt(s.capital.banked) : "", sgn(s.capital ? s.capital.profit : 0)),
     kpi("Floating P&L", fmt(s.floating_pnl||0), (s.positions||[]).length+" open", sgn(s.floating_pnl||0)),
     kpi("Today", pct(lc.daily_pct), "limit -2%", sgn(lc.daily_pct||0)),
     kpi("This week", pct(lc.weekly_pct), "limit -4%", sgn(lc.weekly_pct||0)),

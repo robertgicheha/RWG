@@ -32,7 +32,7 @@ from core.fx_trend_analytics import flip_analysis, signal_levels, strength
 from core.fx_trend_broker import Broker, Position
 from core.fx_trend_journal import Journal
 from strategy.fx_risk import (
-    RiskLimits, entry_block_reason, halt_reason, in_cooldown, net_exposure,
+    RiskLimits, entry_block_reason, halt_reason, in_cooldown, net_exposure, sizing_equity,
 )
 from strategy.fx_trend import (
     TrendParams, compute_indicators, currency_legs, initial_stop, trail_stop,
@@ -56,6 +56,8 @@ class RunnerConfig:
     weekly_loss_halt_pct: float = 4.0
     max_spread_pips: float = 3.0
     max_lots_per_order: float = 1.0
+    reinvest_pct: float = 100.0      # % of profit above starting capital that is reinvested in sizing
+    starting_capital: float = 0.0    # 0 = use account equity at the first cycle
     kill_file: str = "data/fx_trend.KILL"
     state_file: str = "data/fx_trend_state.json"
     snapshot_file: str = "data/fx_trend_snapshot.json"
@@ -120,10 +122,19 @@ class FxTrendRunner:
                 "open_time": p.open_time,
                 "dist_to_sl_pct": round(abs(px - p.sl) / px * 100, 3) if px and p.sl else None,
             })
+        acct = self.broker.account_summary()
+        base = state.get("starting_capital") or 0.0
+        profit = (acct.get("equity", 0.0) - base) if base else 0.0
+        r = min(max(self.cfg.reinvest_pct, 0.0), 100.0) / 100.0
+        capital = {"starting_capital": base, "profit": round(profit, 2),
+                   "reinvest_pct": self.cfg.reinvest_pct,
+                   "reinvested": round(max(profit, 0.0) * r, 2),
+                   "banked": round(max(profit, 0.0) * (1 - r), 2)}
         snap = {
+            "capital": capital,
             "ts": now.isoformat(timespec="seconds"),
             "mode": "dry_run" if self.cfg.dry_run else "orders",
-            "account": self.broker.account_summary(),
+            "account": acct,
             "positions": positions,
             "floating_pnl": round(sum(p["profit"] for p in positions), 2),
             "last_bar": state.get("last_bar"),
@@ -198,6 +209,10 @@ class FxTrendRunner:
 
         # ---- loss halts --------------------------------------------------
         equity = self.broker.equity()
+        if not state.get("starting_capital"):
+            state["starting_capital"] = cfg.starting_capital or equity
+            self._event("capital", f"starting capital set to {state['starting_capital']:.2f}")
+        size_eq = sizing_equity(equity, state["starting_capital"], cfg.reinvest_pct)
         iso = now.isocalendar()
         wk = f"{iso.year}-W{iso.week:02d}"
         if state.get("week") != wk:
@@ -291,7 +306,7 @@ class FxTrendRunner:
                     continue
                 entry = q.ask if want > 0 else q.bid
                 stop = initial_stop(want, entry, row["atr"], p.atr_stop_mult)
-                lots = min(self.broker.lots_for_risk(pair, want, equity * p.risk_pct / 100.0, entry, stop),
+                lots = min(self.broker.lots_for_risk(pair, want, size_eq * p.risk_pct / 100.0, entry, stop),
                            cfg.max_lots_per_order)
                 if lots <= 0:
                     skip(pair, "risk-sized lot below broker minimum")
