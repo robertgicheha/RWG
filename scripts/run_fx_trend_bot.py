@@ -31,6 +31,7 @@ sys.path.append(str(ROOT))
 
 from core.fx_trend_broker import MT5Broker
 from core.fx_trend_runner import FxTrendRunner, RunnerConfig
+from core.fx_trend_supervisor import pid_alive
 from strategy.fx_trend import TrendParams
 
 log = logging.getLogger("fx_trend_bot")
@@ -127,6 +128,18 @@ def main():
     stop_file, kill_file = ROOT / "data" / "fx_trend.STOP", ROOT / cfg.kill_file
     pid_file, hb = ROOT / "data" / "fx_trend.pid", ROOT / sch["heartbeat_file"]
     pid_file.parent.mkdir(parents=True, exist_ok=True)
+    # Single instance: two copies would fight over the heartbeat/snapshot (and, with orders on,
+    # could open duplicate positions). Watch the running one with the dashboard or data/logs/fx_trend.log.
+    try:
+        other = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        other = 0
+    if other and other != os.getpid() and pid_alive(other):
+        msg = (f"Bot already running (pid {other}). Not starting a second copy. "
+               f"Use the dashboard Control tab to stop/restart it, or tail data\\logs\\fx_trend.log.")
+        log.error(msg)
+        broker.shutdown()
+        sys.exit(msg)
     pid_file.write_text(str(os.getpid()))
     stop_file.unlink(missing_ok=True)
 
