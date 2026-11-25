@@ -83,21 +83,28 @@ class MT5Broker:
         return mt5.ORDER_FILLING_RETURN
 
     # -- Broker surface ----------------------------------------------------
-    def connect(self) -> bool:
-        try:
-            mt5 = get_mt5()
-            ok = mt5.initialize(self.terminal_path) if self.terminal_path else mt5.initialize()
-            if not ok:
-                logger.error("MT5 initialize failed: %s", mt5.last_error())
-                return False
-            if self.login and not mt5.login(self.login, password=self.password, server=self.server):
-                logger.error("MT5 login failed: %s", mt5.last_error())
-                mt5.shutdown()
-                return False
-        except Exception as e:  # ImportError off-Windows, bridge down, ...
-            logger.error("MT5 unavailable: %s", e)
-            return False
-        return True
+    def connect(self, attempts: int = 6, wait_s: float = 15.0, timeout_ms: int = 30_000) -> bool:
+        """Attach to the terminal. Right after a reboot or a terminal update the terminal is
+        still starting and initialize() can block or fail, so wait with a timeout and retry
+        instead of hanging forever or giving up on the first try."""
+        import time as _time
+        for i in range(1, attempts + 1):
+            try:
+                mt5 = get_mt5()
+                args = (self.terminal_path,) if self.terminal_path else ()
+                if mt5.initialize(*args, timeout=timeout_ms):
+                    if not self.login or mt5.login(self.login, password=self.password, server=self.server):
+                        return True
+                    logger.error("MT5 login failed: %s", mt5.last_error())
+                    mt5.shutdown()
+                else:
+                    logger.error("MT5 initialize failed: %s", mt5.last_error())
+            except Exception as e:  # ImportError off-Windows, bridge down, ...
+                logger.error("MT5 unavailable: %s", e)
+            if i < attempts:
+                logger.warning("MT5 not ready (attempt %d/%d), retrying in %.0fs", i, attempts, wait_s)
+                _time.sleep(wait_s)
+        return False
 
     def shutdown(self) -> None:
         try:
