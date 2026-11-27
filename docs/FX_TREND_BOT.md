@@ -1,7 +1,40 @@
 # FX Trend Bot
 
-Daily time-series-momentum bot for FX majors/crosses on MT5, with an admin dashboard.
+Daily FX bot for majors/crosses on MT5, with an admin dashboard.
 No strategy is guaranteed to profit. Validate on a demo account first.
+
+## Strategy and evidence (measured 2026-11-26)
+Active style: `pullback` (config/fx_trend.yaml). Long when close > SMA200 and RSI(2) < 5, short
+mirrored. Exit when close crosses back over SMA5, after 5 daily bars, or at the 2 x ATR stop.
+
+Portfolio backtest, 8 configured pairs, about 18 years, 0.5% risk, modelled costs:
+
+| | old `trend` rules | `pullback` + breakers |
+|---|---|---|
+| Total return | -36.1% | +7.3% |
+| Per year (CAGR) | -2.2% | +0.35% |
+| Max drawdown | -42.6% | -7.9% |
+| Profit factor | 0.85 | 1.07 |
+| Win rate | 31% | 61% |
+
+**Do not read this as a reliable profit source.**
+- With 1.0 pip slippage and double swap, the result is break-even (-0.3%).
+- It was picked from 36 variants using both halves of the history, so those numbers flatter it.
+- On four pairs not used in that selection (NZDUSD, EURGBP, AUDJPY, EURCHF) per-trade profit
+  factor was 1.10 at stop 2 (t = 0.8: not distinguishable from zero), 0.98 at double costs.
+- Doubling risk to 1% barely raised the return and about doubled the drawdown.
+
+## Circuit breakers (`risk:` in the config)
+- Every order carries a stop-loss. Gaps and slippage can make a loss larger than planned.
+- 4 losses in a row: 5-day pause, then half risk until a win.
+- 7 losses in a row, or 8% below peak equity: entries LOCK until
+  `python scripts/run_fx_trend_bot.py --reset-breaker`. Exits and stops keep working.
+- Streak guard: an entry is refused if losing it plus all open positions would exceed 7.
+  So 8 in a row cannot happen without a reset. A reset starts a new count, so a loss right
+  after one can be the 8th in a row in the account history.
+- Breakers count closed trades, so they never trigger in dry-run (nothing closes there).
+- The daily, weekly and drawdown limits use whole-account equity, including other bots' trades.
+- Stale prices (older than 5 days), unreadable equity or missing data for a held pair: no action.
 
 ## Files
 | File | Role |
@@ -31,7 +64,7 @@ No strategy is guaranteed to profit. Validate on a demo account first.
 (stays until cleared). Logs: `data/logs/fx_trend.log`, `fx_trend_errors.log`, `fx_trend_console.log`.
 
 ## Tests
-`pytest tests/test_fx_trend.py tests/test_fx_trend_runner.py tests/test_fx_admin.py`
+`pytest`
 
 ## Validating the strategy honestly
 1. Export real history from the broker you will trade:
@@ -43,6 +76,8 @@ No strategy is guaranteed to profit. Validate on a demo account first.
      out-of-sample numbers, the *efficiency* (OOS/in-sample Sharpe; below ~0.5 = curve-fitting) and
      *parameter stability* (a winner that changes every fold means no real edge).
    - It compares the baseline grid against one with the whipsaw filters on the same folds.
+The backtest script reads the strategy and risk settings from `config/fx_trend.yaml`.
+
 3. Only if the filters win out-of-sample, enable them in `config/fx_trend.yaml`
    (`min_entry_strength_atr`, `cooldown_days`). They are OFF by default.
 

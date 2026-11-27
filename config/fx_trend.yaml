@@ -7,10 +7,19 @@ fx_trend:
   pairs: [EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, USDCHF, EURJPY, GBPJPY]
 
   strategy:
-    sma_len: 100
+    # pullback: inside a long-term trend (200-day average), buy a sharp 2-day dip (sell a
+    # sharp rally in a downtrend); leave when price recovers past the 5-day average, after
+    # 5 days, or at the stop. Set style: trend for the old rules (they lost 36% in backtest).
+    # The pullback edge is SMALL and sensitive to trading costs: see docs/FX_TREND_BOT.md.
+    style: pullback
+    sma_len: 200
     mom_len: 90
     atr_len: 14
-    atr_stop_mult: 3.0
+    atr_stop_mult: 2.0     # stop-loss distance in ATRs, attached to every order
+    rsi_len: 2
+    rsi_entry: 5.0
+    exit_sma_len: 5
+    max_hold_days: 5
     risk_pct: 0.5          # % of equity lost if a stop is hit
     allow_short: true
     # Whipsaw filters: OFF until `run_fx_trend_backtest.py --walk-forward` says they help.
@@ -27,10 +36,17 @@ fx_trend:
     starting_capital: 0     # 0 = account equity when the bot first runs (set it if you top up)
 
   risk:
-    max_open_positions: 6
+    max_open_positions: 4     # with risk_pct 0.5, about 2% of equity at risk if all stops hit
     max_net_per_currency: 3   # blocks e.g. long EURUSD+GBPUSD+AUDUSD+NZDUSD (one USD bet)
     daily_loss_halt_pct: 2.0
     weekly_loss_halt_pct: 4.0
+    # Circuit breakers (count this bot's own closed trades).
+    pause_after_losses: 4       # after 4 losses in a row: no new entries for pause_days,
+    pause_days: 5               # then trade at pause_risk_factor x risk until a win
+    pause_risk_factor: 0.5
+    max_consecutive_losses: 7   # LOCK at 7. Entries are refused if open positions could reach 8.
+    max_drawdown_halt_pct: 8.0  # LOCK if account equity falls 8% from its peak
+    # Unlock after reviewing: python scripts/run_fx_trend_bot.py --reset-breaker
     max_spread_pips: 3.0
     max_lots_per_order: 1.0
 

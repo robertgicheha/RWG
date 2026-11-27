@@ -5,6 +5,7 @@ Run the daily FX trend bot against MT5.
   python scripts/run_fx_trend_bot.py --once          # one cycle, then exit
   python scripts/run_fx_trend_bot.py --send-orders   # real orders, DEMO accounts only
   python scripts/run_fx_trend_bot.py --send-orders --allow-live --i-understand-the-risk
+  python scripts/run_fx_trend_bot.py --reset-breaker  # unlock after reviewing the losses
 
 Control (the admin dashboard does this for you):
   data/fx_trend.STOP  -> graceful exit, positions stay open
@@ -82,7 +83,15 @@ def main():
     ap.add_argument("--send-orders", action="store_true", help="disable dry-run")
     ap.add_argument("--allow-live", action="store_true")
     ap.add_argument("--i-understand-the-risk", action="store_true")
+    ap.add_argument("--reset-breaker", action="store_true",
+                    help="unlock the circuit breaker (applies on the bot's next poll)")
     args = ap.parse_args()
+    if args.reset_breaker:
+        flag = ROOT / RunnerConfig.breaker_reset_file
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text(datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        print("Breaker reset requested. Review why it locked before trading on.")
+        return
     setup_logging()
 
     # .env (MT5 / Telegram creds) if python-dotenv is available
@@ -99,6 +108,8 @@ def main():
         max_open_positions=rk["max_open_positions"], max_net_per_currency=rk["max_net_per_currency"],
         daily_loss_halt_pct=rk["daily_loss_halt_pct"], weekly_loss_halt_pct=rk["weekly_loss_halt_pct"],
         max_spread_pips=rk["max_spread_pips"], max_lots_per_order=rk["max_lots_per_order"],
+        **{k: rk[k] for k in ("max_consecutive_losses", "pause_after_losses", "pause_days",
+                              "pause_risk_factor", "max_drawdown_halt_pct") if k in rk},
         reinvest_pct=y.get("capital", {}).get("reinvest_pct", 100.0),
         starting_capital=y.get("capital", {}).get("starting_capital", 0.0),
         kill_file=sch["kill_file"], state_file=sch["state_file"],

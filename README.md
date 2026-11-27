@@ -1,6 +1,6 @@
 # RWG
 
-Daily trend-following FX bot for MetaTrader 5, with a backtester and an admin dashboard.
+Daily FX bot (pullback-in-trend, with circuit breakers) for MetaTrader 5, with a backtester and an admin dashboard.
 
 No strategy is guaranteed to make money, and most retail FX accounts lose. The bot is
 **dry-run by default**, refuses live accounts unless you pass explicit CLI flags, and

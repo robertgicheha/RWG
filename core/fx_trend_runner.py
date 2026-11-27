@@ -15,6 +15,9 @@ Safety rails (all on by default):
   * every order carries a stop-loss at send time
   * only touches positions with its own magic number
   * kill switch file: next cycle flattens and stops
+  * circuit breakers: pause after a short losing streak; lock new entries at the
+    streak limit or max drawdown until a human resets them
+  * stale prices or an unreadable account: do nothing and retry
   * daily / weekly loss halts, max positions, per-currency exposure cap,
     spread guard, lots rounded DOWN so risk is never exceeded
   * broker positions are the source of truth each cycle (reconciliation)
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,7 +36,8 @@ from core.fx_trend_analytics import flip_analysis, running_stats, signal_levels,
 from core.fx_trend_broker import Broker, Position
 from core.fx_trend_journal import Journal
 from strategy.fx_risk import (
-    RiskLimits, entry_block_reason, halt_reason, in_cooldown, net_exposure, sizing_equity,
+    RiskLimits, entry_block_reason, halt_reason, in_cooldown, in_loss_pause, lock_reason,
+    loss_streak, net_exposure, risk_multiplier, sizing_equity, streak_has_room,
 )
 from strategy.fx_trend import (
     TrendParams, compute_indicators, currency_legs, initial_stop, trail_stop,
@@ -54,6 +59,13 @@ class RunnerConfig:
     max_net_per_currency: int = 3
     daily_loss_halt_pct: float = 2.0
     weekly_loss_halt_pct: float = 4.0
+    max_consecutive_losses: int = 0
+    pause_after_losses: int = 0
+    pause_days: int = 5
+    pause_risk_factor: float = 0.5
+    max_drawdown_halt_pct: float = 0.0
+    max_data_age_days: int = 5       # newest closed daily bar older than this = stale (covers holidays)
+    breaker_reset_file: str = "data/fx_trend.RESET_BREAKER"
     max_spread_pips: float = 3.0
     max_lots_per_order: float = 1.0
     reinvest_pct: float = 100.0      # % of profit above starting capital that is reinvested in sizing
@@ -75,7 +87,14 @@ def _save(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2, default=str))
-    tmp.replace(path)
+    for attempt in range(5):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:      # Windows: a reader has the file open for a moment
+            if attempt == 4:
+                raise
+            time.sleep(0.1)
 
 
 class FxTrendRunner:
@@ -139,12 +158,15 @@ class FxTrendRunner:
             "floating_pnl": round(sum(p["profit"] for p in positions), 2),
             "last_bar": state.get("last_bar"),
             "halted": self._halted,
+            "breaker": {"loss_streak": state.get("loss_streak", 0),
+                        "locked": state.get("breaker_locked")},
             "pairs": self.cfg.pairs,
         }
         _save(self.base / self.cfg.snapshot_file, snap)
         return snap
 
-    def sync_trades(self, now: datetime, force: bool = False) -> int:
+    def sync_trades(self, now: datetime, force: bool = False) -> int | None:
+        """Returns the number of trades read, or None if the history could not be read."""
         if not force and self._last_trade_sync and (now - self._last_trade_sync).total_seconds() < TRADE_SYNC_SECONDS:
             return 0
         self._last_trade_sync = now
@@ -156,7 +178,7 @@ class FxTrendRunner:
             return len(trades)
         except Exception:
             logger.exception("trade sync failed")
-            return 0
+            return None
 
     def _announce_closed(self, new: list[dict], now: datetime) -> None:
         """After each newly closed trade: its P&L, total money made so far, and win rate."""
@@ -199,6 +221,38 @@ class FxTrendRunner:
             logger.exception("candle export failed")
 
     # ------------------------------------------------------------------
+    def _apply_breaker_reset(self, state: dict, state_path: Path) -> None:
+        """A human asked to unlock: forget the streak and restart the drawdown peak."""
+        flag = self.base / self.cfg.breaker_reset_file
+        if not flag.exists():
+            return
+        self.sync_trades(datetime.now(timezone.utc), force=True)
+        state["streak_since"] = max((t.get("close_time") or "" for t in self.journal.trades(5000)), default="")
+        for key in ("breaker_locked", "peak_equity", "loss_streak"):
+            state.pop(key, None)
+        _save(state_path, state)
+        flag.unlink(missing_ok=True)
+        self._act("breaker", "", "circuit breaker RESET by operator")
+
+    def _loss_record(self, state: dict) -> tuple[int, datetime | None]:
+        """(current losing streak, close time of the latest loss) since the last reset."""
+        since = state.get("streak_since", "")
+        done = [r for r in running_stats(self.journal.trades(5000)) if (r.get("close_time") or "") > since]
+        streak = loss_streak(r["net"] for r in done)
+        try:
+            last = datetime.fromisoformat(done[-1]["close_time"]) if streak else None
+        except (ValueError, TypeError):
+            last = None
+        return streak, last
+
+    def _skip_cycle(self, summary: dict, why: str, msg: str) -> dict:
+        """Do nothing and leave last_bar alone, so the next poll tries again."""
+        logger.warning(msg)
+        self._event("data", msg, level="WARNING")
+        summary["skipped"] = why
+        return summary
+
+    # ------------------------------------------------------------------
     def run_once(self, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
         cfg, p = self.cfg, self.cfg.params
@@ -214,6 +268,8 @@ class FxTrendRunner:
             summary["skipped"] = "kill_switch"
             return summary
 
+        self._apply_breaker_reset(state, state_path)
+
         # ---- cheap new-bar probe (avoids downloading history every poll) --
         probe = self.broker.latest_bar_date(cfg.pairs[0]) if cfg.pairs else None
         if probe and probe == state.get("last_bar"):
@@ -222,9 +278,14 @@ class FxTrendRunner:
 
         # ---- data --------------------------------------------------------
         frames = {}
+        oldest_ok = (now - timedelta(days=cfg.max_data_age_days)).strftime("%Y-%m-%d")
         for pair in cfg.pairs:
             df = self.broker.daily_bars(pair, cfg.history_bars)
-            if len(df) >= p.warmup + 5:
+            if len(df) and df.index[-1].strftime("%Y-%m-%d") < oldest_ok:
+                msg = f"{pair}: STALE data (newest bar {df.index[-1]:%Y-%m-%d}), skipped"
+                logger.warning(msg)
+                self._event("data", msg, pair, "WARNING")
+            elif len(df) >= p.warmup + 5:
                 frames[pair] = df
             else:
                 logger.warning("%s: only %d bars, skipped", pair, len(df))
@@ -239,9 +300,15 @@ class FxTrendRunner:
         if state.get("last_bar") == latest_bar:
             summary["skipped"] = "already_processed"
             return summary
+        # a held pair without data cannot be managed: wait, do not consume the bar
+        unmanaged = [pos.pair for pos in self.broker.positions() if pos.pair in cfg.pairs and pos.pair not in frames]
+        if unmanaged:
+            return self._skip_cycle(summary, "incomplete_data", f"no usable data for held pair(s) {unmanaged}")
 
         # ---- loss halts --------------------------------------------------
         equity = self.broker.equity()
+        if not equity or equity <= 0:
+            return self._skip_cycle(summary, "bad_account", f"account equity unreadable ({equity})")
         if not state.get("starting_capital"):
             state["starting_capital"] = cfg.starting_capital or equity
             self._event("capital", f"starting capital set to {state['starting_capital']:.2f}")
@@ -254,8 +321,28 @@ class FxTrendRunner:
         daily_pct = (equity / prev_eq - 1) * 100 if prev_eq else 0.0
         weekly_pct = (equity / state["week_start_equity"] - 1) * 100 if state.get("week_start_equity") else 0.0
         limits = RiskLimits(cfg.max_open_positions, cfg.max_net_per_currency,
-                            cfg.daily_loss_halt_pct, cfg.weekly_loss_halt_pct)
+                            cfg.daily_loss_halt_pct, cfg.weekly_loss_halt_pct,
+                            cfg.max_consecutive_losses, cfg.pause_after_losses, cfg.pause_days,
+                            cfg.pause_risk_factor, cfg.max_drawdown_halt_pct)
         why_halted = halt_reason(daily_pct, weekly_pct, limits)
+
+        # ---- circuit breakers ----------------------------------------------
+        history_ok = self.sync_trades(now, force=True) is not None
+        streak, last_loss = self._loss_record(state)
+        peak = max(state.get("peak_equity") or equity, equity)
+        state.update(peak_equity=peak, loss_streak=streak)
+        if not state.get("breaker_locked"):
+            locked = lock_reason(streak, (equity / peak - 1) * 100, limits)
+            if locked:
+                state["breaker_locked"] = locked
+                self._act("breaker", "", f"CIRCUIT BREAKER LOCKED: {locked}. No new entries until reset.")
+        if state.get("breaker_locked"):
+            why_halted = f"circuit breaker locked ({state['breaker_locked']}); reset required"
+        elif in_loss_pause(streak, last_loss, now, limits):
+            why_halted = f"pausing {limits.pause_days}d after {streak} losses in a row"
+        elif not history_ok and (limits.max_consecutive_losses or limits.pause_after_losses):
+            why_halted = "trade history unreadable, cannot check the losing streak"
+        risk_pct = p.risk_pct * risk_multiplier(streak, limits)
         halted = why_halted is not None
         self._halted = halted
         if halted:
@@ -281,20 +368,27 @@ class FxTrendRunner:
         self.journal.add_signals(latest_bar, sig_rows)
 
         # ---- 1. manage existing positions ---------------------------------
-        positions = [pos for pos in self.broker.positions() if pos.pair in frames]
-        remaining: list[Position] = []
-        for pos in positions:
+        held = self.broker.positions()
+        # positions in pairs no longer configured still count against every limit
+        remaining: list[Position] = [pos for pos in held if pos.pair not in frames]
+        timed_out_pairs: set[str] = set()
+        for pos in (x for x in held if x.pair in frames):
             row = rows[pos.pair]
-            want = int(row["signal"])
-            if want != pos.side:
-                self._act("close", pos.pair, f"CLOSE {pos.pair} signal {pos.side:+d} -> {want:+d}")
+            bars_held = int((inds[pos.pair].index >= pos.open_time[:10]).sum()) if pos.open_time else 0
+            timed_out = bool(p.max_hold_days) and bars_held >= p.max_hold_days
+            if timed_out or bool(row["exit_long" if pos.side > 0 else "exit_short"]):
+                why = f"held {bars_held} days" if timed_out else "exit rule"
+                if timed_out:
+                    timed_out_pairs.add(pos.pair)
+                self._act("close", pos.pair, f"CLOSE {pos.pair} {'LONG' if pos.side > 0 else 'SHORT'} ({why})")
                 summary["actions"].append(("close", pos.pair))
                 if not cfg.dry_run and not self.broker.close(pos):
                     self._event("order", f"CLOSE FAILED {pos.pair}", pos.pair, "ERROR")
                     remaining.append(pos)  # still exposed: keep counting it
                 continue
             base_sl = pos.sl or initial_stop(pos.side, pos.entry, row["atr"], p.atr_stop_mult)
-            new_sl = trail_stop(pos.side, base_sl, row["high"], row["low"], row["atr"], p.atr_stop_mult)
+            new_sl = (trail_stop(pos.side, base_sl, row["high"], row["low"], row["atr"], p.atr_stop_mult)
+                      if p.trails else base_sl)      # a missing stop is always restored
             improved = (pos.sl == 0) or (new_sl > pos.sl if pos.side > 0 else new_sl < pos.sl)
             if improved:
                 self._act("trail", pos.pair, f"TRAIL {pos.pair} SL {pos.sl:.5f} -> {new_sl:.5f}")
@@ -318,7 +412,11 @@ class FxTrendRunner:
         if not halted:
             for pair, row in rows.items():
                 want = int(row["signal"])
-                if want == 0 or pair in open_pairs:
+                if want == 0 or pair in open_pairs or pair in timed_out_pairs:
+                    continue
+                if not streak_has_room(streak, len(open_list), limits):
+                    skip(pair, f"streak guard: {streak} losses + {len(open_list)} open positions, one more "
+                               f"could pass {limits.max_consecutive_losses} losses in a row")
                     continue
                 if not bool(row["entry_ok"]):
                     skip(pair, f"signal too weak ({row['strength']:+.2f} ATR < "
@@ -341,13 +439,13 @@ class FxTrendRunner:
                     continue
                 entry = q.ask if want > 0 else q.bid
                 stop = initial_stop(want, entry, row["atr"], p.atr_stop_mult)
-                lots = min(self.broker.lots_for_risk(pair, want, size_eq * p.risk_pct / 100.0, entry, stop),
+                lots = min(self.broker.lots_for_risk(pair, want, size_eq * risk_pct / 100.0, entry, stop),
                            cfg.max_lots_per_order)
                 if lots <= 0:
                     skip(pair, "risk-sized lot below broker minimum")
                     continue
                 self._act("open", pair, f"OPEN {pair} {'LONG' if want > 0 else 'SHORT'} {lots} lots "
-                                        f"@~{entry:.5f} SL {stop:.5f} (risk {p.risk_pct}%)")
+                                        f"@~{entry:.5f} SL {stop:.5f} (risk {risk_pct}%)")
                 if not cfg.dry_run and self.broker.open(pair, want, lots, stop) is None:
                     self.notify(f"FX trend bot: ORDER FAILED {pair}")
                     self._event("order", f"OPEN FAILED {pair}", pair, "ERROR")

@@ -37,6 +37,23 @@ class TrendParams:
     # walk-forward test (strategy/fx_trend_walkforward.py) shows they help.
     min_entry_strength_atr: float = 0.0  # open only if |close - SMA| >= this many ATRs (holding is unaffected)
     cooldown_days: int = 0               # after a LOSING close, don't re-enter that pair for N calendar days
+    # Entry style. "trend" = the rules in the module docstring. "pullback" = with
+    # close above the SMA(sma_len), buy when RSI(rsi_len) < rsi_entry (mirrored for
+    # shorts); leave when close crosses back over SMA(exit_sma_len).
+    style: str = "trend"
+    rsi_len: int = 2
+    rsi_entry: float = 5.0
+    exit_sma_len: int = 5
+    max_hold_days: int = 0               # leave after N closed daily bars (0 = no time limit)
+
+    def __post_init__(self):
+        if self.style not in ("trend", "pullback"):
+            raise ValueError(f"unknown strategy style {self.style!r}")
+
+    @property
+    def trails(self) -> bool:
+        """Only trend following ratchets its stop; a pullback trade keeps the initial one."""
+        return self.style == "trend"
 
     @property
     def warmup(self) -> int:
@@ -55,12 +72,22 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.ewm(alpha=1.0 / n, adjust=False, min_periods=n).mean()
 
 
-def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.DataFrame:
-    """Return a copy with sma, mom, atr, strength, signal (+1/-1/0) and entry_ok.
+def rsi(close: pd.Series, n: int = 2) -> pd.Series:
+    """Wilder RSI. Row t uses data up to and including bar t only."""
+    delta = close.diff()
+    up = delta.clip(lower=0).ewm(alpha=1.0 / n, adjust=False).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1.0 / n, adjust=False).mean()
+    return 100.0 - 100.0 / (1.0 + up / down)
 
-    signal[t] depends only on bars <= t (no look-ahead). It is NaN-safe: during
-    warm-up the signal is 0. `signal` decides what to HOLD; `entry_ok` is the
-    extra condition for OPENING a new position (see min_entry_strength_atr).
+
+def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.DataFrame:
+    """Return a copy with sma, mom, atr, strength, signal (+1/-1/0), entry_ok,
+    exit_long and exit_short.
+
+    Every column at row t depends only on bars <= t (no look-ahead). It is
+    NaN-safe: during warm-up the signal is 0. `signal` is the side to OPEN,
+    `entry_ok` the extra condition for opening it (see min_entry_strength_atr),
+    and exit_long / exit_short say when to LEAVE a position already held.
     """
     out = df.copy()
     out["sma"] = out["close"].rolling(p.sma_len, min_periods=p.sma_len).mean()
@@ -69,8 +96,20 @@ def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.D
 
     long_ = (out["close"] > out["sma"]) & (out["mom"] > 0)
     short_ = (out["close"] < out["sma"]) & (out["mom"] < 0) if p.allow_short else False
+    ready = out[["sma", "mom", "atr"]].notna().all(axis=1)
+    if p.style == "pullback":
+        out["rsi"] = rsi(out["close"], p.rsi_len)
+        exit_sma = out["close"].rolling(p.exit_sma_len, min_periods=p.exit_sma_len).mean()
+        long_ = (out["close"] > out["sma"]) & (out["rsi"] < p.rsi_entry)
+        short_ = (out["close"] < out["sma"]) & (out["rsi"] > 100.0 - p.rsi_entry) if p.allow_short else False
     sig = np.where(long_, 1, np.where(short_, -1, 0))
-    out["signal"] = pd.Series(sig, index=out.index).where(out[["sma", "mom", "atr"]].notna().all(axis=1), 0).astype(int)
+    out["signal"] = pd.Series(sig, index=out.index).where(ready, 0).astype(int)
+    if p.style == "pullback":
+        out["exit_long"] = out["close"] > exit_sma
+        out["exit_short"] = out["close"] < exit_sma
+    else:
+        out["exit_long"] = out["signal"] != 1
+        out["exit_short"] = out["signal"] != -1
     out["strength"] = (out["close"] - out["sma"]) / out["atr"]
     out["entry_ok"] = (out["signal"] != 0) & (out["strength"].abs() >= p.min_entry_strength_atr)
     return out

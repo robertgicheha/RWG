@@ -12,7 +12,9 @@ day held; default is a flat COST, i.e. carry is not credited).
 
 Risk controls modelled: risk_pct sizing from the ATR stop, leverage cap per
 position, max concurrent positions, max net exposure per single currency,
-daily-loss and weekly-loss entry halts.
+daily-loss and weekly-loss entry halts, and the losing-streak / drawdown circuit
+breakers. Live, a lock stays until a human resets it; here the reset is assumed
+to happen `lock_review_days` later, and every lock is counted.
 
 Simplification: P&L is computed as return on notional (account-currency
 notional * price return), exact for USD-quoted pairs and a close approximation
@@ -29,7 +31,8 @@ import numpy as np
 import pandas as pd
 
 from strategy.fx_risk import (
-    RiskLimits, entry_block_reason, halt_reason, in_cooldown, net_exposure, sizing_equity,
+    RiskLimits, entry_block_reason, halt_reason, in_cooldown, in_loss_pause, lock_reason,
+    net_exposure, risk_multiplier, sizing_equity, streak_has_room,
 )
 from strategy.fx_trend import (
     TrendParams, compute_indicators, currency_legs, initial_stop,
@@ -61,10 +64,18 @@ class BtConfig:
     daily_loss_halt_pct: float = 2.0     # no new entries next bar after a day down this much
     weekly_loss_halt_pct: float = 4.0    # no new entries for rest of ISO week
     trading_enabled_from: pd.Timestamp | None = None  # evaluate only from here (warm-up before)
+    max_consecutive_losses: int = 0
+    pause_after_losses: int = 0
+    pause_days: int = 5
+    pause_risk_factor: float = 0.5
+    max_drawdown_halt_pct: float = 0.0
+    lock_review_days: int = 30
 
     def risk_limits(self) -> RiskLimits:
         return RiskLimits(self.max_open_positions, self.max_net_per_currency,
-                          self.daily_loss_halt_pct, self.weekly_loss_halt_pct)
+                          self.daily_loss_halt_pct, self.weekly_loss_halt_pct,
+                          self.max_consecutive_losses, self.pause_after_losses, self.pause_days,
+                          self.pause_risk_factor, self.max_drawdown_halt_pct)
 
 
 @dataclass
@@ -96,7 +107,8 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
                  cfg: BtConfig | None = None) -> dict:
     cfg = cfg or BtConfig()
     ind = {pair: compute_indicators(df, p) for pair, df in frames.items()}
-    rows = {pair: df[["open", "high", "low", "close", "atr", "signal", "entry_ok"]].to_dict("index")
+    rows = {pair: df[["open", "high", "low", "close", "atr", "signal", "entry_ok",
+                      "exit_long", "exit_short"]].to_dict("index")
             for pair, df in ind.items()}
     limits = cfg.risk_limits()
     dates = sorted(set().union(*[set(r) for r in rows.values()]))
@@ -107,6 +119,9 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
     pos: dict[str, dict] = {}
     pending: dict[str, int] = {}          # signal from previous close, per pair
     pending_ok: dict[str, bool] = {}      # whether that signal also passes the entry filter
+    pending_exit: dict[str, tuple[bool, bool]] = {}   # (leave a long?, leave a short?)
+    streak, locks, locked_since, last_any_loss = 0, 0, None, None
+    peak_equity = cfg.initial_equity
     last_close: dict[str, float] = {}
     last_atr: dict[str, float] = {}
     trades: list[Trade] = []
@@ -123,7 +138,7 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
                           for pair, ps in pos.items())
 
     def close_position(pair: str, date, price: float, reason: str):
-        nonlocal cash
+        nonlocal cash, streak, last_any_loss
         ps = pos.pop(pair)
         px = _fill(price, -ps["side"], pair, cfg)
         gross = ps["notional"] * ps["side"] * (px / ps["entry"] - 1.0)
@@ -131,6 +146,9 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
         net_pnl = gross - ps["swap_total"]
         if net_pnl < 0:
             last_loss_close[pair] = date
+            streak, last_any_loss = streak + 1, date
+        else:
+            streak = 0
         trades.append(Trade(pair, ps["side"], ps["entry_time"], date, ps["entry"], px,
                             ps["notional"], net_pnl, ps["equity_at_entry"], reason))
 
@@ -155,11 +173,17 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
         # ---- 1. stops (level set at the previous close) ----
         stopped_today = {pair for pair in list(pos) if check_stop(pair, date)}
 
-        # ---- 2. signal exits, then entries, at today's open ----
-        for pair, want in pending.items():
-            bar = rows[pair].get(date)
-            if bar is not None and pair in pos and pos[pair]["side"] != want:
-                close_position(pair, date, bar["open"], "signal")
+        # ---- 2. signal / time exits, then entries, at today's open ----
+        timed_out_today = set()
+        for pair, (leave_long, leave_short) in pending_exit.items():
+            bar, ps = rows[pair].get(date), pos.get(pair)
+            if bar is None or ps is None:
+                continue
+            timed_out = bool(p.max_hold_days) and ps["bars_held"] >= p.max_hold_days
+            if timed_out or (leave_long if ps["side"] > 0 else leave_short):
+                close_position(pair, date, bar["open"], "time" if timed_out else "signal")
+                if timed_out:
+                    timed_out_today.add(pair)
 
         tradable = cfg.trading_enabled_from is None or date >= cfg.trading_enabled_from
         iso = date.isocalendar()
@@ -167,14 +191,24 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
         weekly_pct = (mark() / week_start_equity - 1.0) * 100 if week_key == wk else 0.0
         halted = halt_reason(last_daily_pct, weekly_pct, limits) is not None
 
+        eq_now = mark()
+        peak_equity = max(peak_equity, eq_now)
+        if locked_since is not None and (date - locked_since).days >= cfg.lock_review_days:
+            locked_since, streak, peak_equity = None, 0, eq_now      # simulated manual reset
+        if locked_since is None and lock_reason(streak, (eq_now / peak_equity - 1) * 100, limits):
+            locked_since, locks = date, locks + 1
+        halted = halted or locked_since is not None or in_loss_pause(streak, last_any_loss, date, limits)
+
         if tradable and not halted:
             net = net_exposure((q, ps["side"]) for q, ps in pos.items())
             for pair, want in pending.items():
                 bar = rows[pair].get(date)
                 # no same-bar re-entry after an intrabar stop-out (the stop happened
                 # AFTER the open we would be filling at)
-                if want == 0 or bar is None or pair in pos or pair in stopped_today:
+                if want == 0 or bar is None or pair in pos or pair in stopped_today or pair in timed_out_today:
                     continue
+                if not streak_has_room(streak, len(pos), limits):
+                    break
                 if not pending_ok.get(pair):          # entry filter (hold logic is unaffected)
                     continue
                 if in_cooldown(last_loss_close.get(pair), date, p.cooldown_days):
@@ -192,11 +226,12 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
                 stop = initial_stop(want, entry, atr_prev, p.atr_stop_mult)
                 eq = mark()
                 notional = position_notional(sizing_equity(eq, cfg.initial_equity, cfg.reinvest_pct),
-                                             p.risk_pct, entry, stop, p.max_leverage_per_pos)
+                                             p.risk_pct * risk_multiplier(streak, limits),
+                                             entry, stop, p.max_leverage_per_pos)
                 if notional <= 0:
                     continue
                 pos[pair] = dict(side=want, entry=entry, stop=stop, notional=notional,
-                                 entry_time=date, equity_at_entry=eq, swap_total=0.0)
+                                 entry_time=date, equity_at_entry=eq, swap_total=0.0, bars_held=0)
                 for c, s in legs.items():
                     net[c] = net.get(c, 0) + s
                 if check_stop(pair, date):   # the entry bar itself can hit the new stop
@@ -214,8 +249,10 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
             bar = rows[pair].get(date)
             if bar is None:
                 continue
-            ps["stop"] = trail_stop(ps["side"], ps["stop"], bar["high"], bar["low"],
-                                    bar["atr"], p.atr_stop_mult)
+            ps["bars_held"] += 1
+            if p.trails:
+                ps["stop"] = trail_stop(ps["side"], ps["stop"], bar["high"], bar["low"],
+                                        bar["atr"], p.atr_stop_mult)
             swap = ps["notional"] * cfg.swap_bps_per_day / 1e4 * days
             ps["swap_total"] += swap
             cash -= swap
@@ -231,6 +268,7 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
             bar = r.get(date)
             if bar is not None:
                 pending[pair], pending_ok[pair] = int(bar["signal"]), bool(bar["entry_ok"])
+                pending_exit[pair] = (bool(bar["exit_long"]), bool(bar["exit_short"]))
 
     # close anything still open at the last close, for reporting
     for pair in list(pos):
@@ -238,7 +276,17 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
     curve = pd.Series(equity_curve)
     if cfg.trading_enabled_from is not None:
         curve = curve[curve.index >= cfg.trading_enabled_from]
-    return {"equity": curve, "trades": trades, "stats": stats(curve, trades)}
+    return {"equity": curve, "trades": trades,
+            "stats": {**stats(curve, trades), "max_loss_streak": longest_loss_streak(trades),
+                      "breaker_locks": locks}}
+
+
+def longest_loss_streak(trades: list[Trade]) -> int:
+    best = cur = 0
+    for t in trades:
+        cur = cur + 1 if t.pnl < 0 else 0
+        best = max(best, cur)
+    return best
 
 
 def stats(curve: pd.Series, trades: list[Trade]) -> dict:

@@ -22,11 +22,12 @@ Usage:
 import argparse
 import json
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import yaml
 
 ROOT = Path(__file__).parent.parent
 sys.path.append(str(ROOT))
@@ -78,6 +79,13 @@ def load_mt5(pairs: list[str], bars: int) -> dict[str, pd.DataFrame]:
     return frames
 
 
+def live_settings(path: Path) -> tuple[dict, dict]:
+    """(strategy params, risk settings for BtConfig) exactly as the live bot reads them."""
+    y = yaml.safe_load(path.read_text(encoding="utf-8"))["fx_trend"]
+    risk = {k: v for k, v in y["risk"].items() if k in {f.name for f in fields(BtConfig)}}
+    return dict(y["strategy"]), risk
+
+
 def show(title: str, res: dict):
     print(f"\n=== {title} ===")
     for k, v in res["stats"].items():
@@ -91,7 +99,8 @@ def main():
     ap.add_argument("--bars", type=int, default=4000)
     ap.add_argument("--pairs", nargs="+", default=DEFAULT_PAIRS)
     ap.add_argument("--equity", type=float, default=10_000.0)
-    ap.add_argument("--risk-pct", type=float, default=0.5)
+    ap.add_argument("--risk-pct", type=float, default=None, help="override the config's risk_pct")
+    ap.add_argument("--config", type=Path, default=ROOT / "config" / "fx_trend.yaml")
     ap.add_argument("--holdout-start", default=None, help="YYYY-MM-DD; judge on data from here on")
     ap.add_argument("--no-grid", action="store_true")
     ap.add_argument("--walk-forward", action="store_true",
@@ -107,8 +116,12 @@ def main():
     if not frames:
         sys.exit("No data loaded.")
 
-    p = TrendParams(risk_pct=args.risk_pct)
-    base = BtConfig(initial_equity=args.equity)
+    strategy, risk = live_settings(args.config)
+    if args.risk_pct is not None:
+        strategy["risk_pct"] = args.risk_pct
+    p = TrendParams(**strategy)
+    base = BtConfig(initial_equity=args.equity, **risk)
+    print(f"Strategy: {p.style}  (settings from {args.config.name})")
     report = {"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
               "source": f"csv:{args.csv_dir}" if args.csv_dir else "mt5",
               "pairs": sorted(frames), "params": asdict(p), "holdout_start": args.holdout_start,
@@ -117,14 +130,14 @@ def main():
 
     if args.holdout_start:
         cut = pd.Timestamp(args.holdout_start)
-        res_in = run_backtest(frames, p, BtConfig(initial_equity=args.equity))
+        res_in = run_backtest(frames, p, base)
         # in-sample = equity curve before the cut
         ins = res_in["equity"][res_in["equity"].index < cut]
         in_stats = stats(ins, [t for t in res_in["trades"] if t.exit_time < cut])
         print("\n=== In-sample (before holdout; fine to study) ===")
         for k, v in in_stats.items():
             print(f"  {k}: {v}")
-        ho = run_backtest(frames, p, BtConfig(initial_equity=args.equity, trading_enabled_from=cut))
+        ho = run_backtest(frames, p, replace(base, trading_enabled_from=cut))
         show(f"HOLDOUT from {cut.date()} (look once, do not re-tune on this)", ho)
         final = ho
         report["in_sample"] = in_stats
@@ -143,9 +156,11 @@ def main():
     report["sensitivity"] = []
     if not args.no_grid:
         print("\n=== Parameter sensitivity (full period) ===  sma/mom/atr_mult -> CAGR%, maxDD%, trades")
-        for sma, mom, mult in [(50, 60, 2.5), (100, 90, 3.0), (150, 120, 3.0), (200, 180, 3.5), (100, 90, 2.0)]:
-            r = run_backtest(frames, TrendParams(sma_len=sma, mom_len=mom, atr_stop_mult=mult,
-                                                 risk_pct=args.risk_pct), base)["stats"]
+        grid = ([(150, 90, 2.0), (200, 90, 1.5), (200, 90, 2.0), (200, 90, 3.0), (250, 90, 2.0)]
+                if p.style == "pullback" else
+                [(50, 60, 2.5), (100, 90, 3.0), (150, 120, 3.0), (200, 180, 3.5), (100, 90, 2.0)])
+        for sma, mom, mult in grid:
+            r = run_backtest(frames, replace(p, sma_len=sma, mom_len=mom, atr_stop_mult=mult), base)["stats"]
             report["sensitivity"].append({"sma": sma, "mom": mom, "atr_mult": mult, **r})
             print(f"  {sma:>3}/{mom:>3}/{mult}: CAGR {r.get('cagr_pct')}%  DD {r.get('max_drawdown_pct')}%  trades {r.get('n_trades')}")
 

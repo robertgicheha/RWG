@@ -141,21 +141,26 @@ class MT5Broker:
         return pd.to_datetime(int(rates[0]["time"]), unit="s").strftime("%Y-%m-%d")
 
     def closed_trades(self, since: datetime) -> list[dict]:
-        """Round-trips (entry deal + exit deal) for this bot's magic number."""
+        """Round-trips (entry deal + exit deal) for positions this bot OPENED.
+
+        Only the entry deal is matched on magic: closing a position by hand in the
+        terminal produces an exit deal with magic 0, and that loss must still count."""
         mt5 = get_mt5()
         from datetime import timedelta
         deals = mt5.history_deals_get(since, datetime.now(timezone.utc) + timedelta(days=1)) or ()
         by_pos: dict[int, list] = {}
         for d in deals:
-            if getattr(d, "magic", None) == self.magic and getattr(d, "position_id", 0):
+            if getattr(d, "position_id", 0):
                 by_pos.setdefault(int(d.position_id), []).append(d)
         out = []
         iso = lambda ts: datetime.fromtimestamp(int(ts), timezone.utc).isoformat(timespec="seconds")  # noqa: E731
         for pid, ds in by_pos.items():
             ins = [d for d in ds if d.entry == mt5.DEAL_ENTRY_IN]
+            if not any(getattr(d, "magic", None) == self.magic for d in ins):
+                continue  # not ours
             outs = [d for d in ds if d.entry != mt5.DEAL_ENTRY_IN]
-            if not ins or not outs:
-                continue  # still open
+            if not outs or sum(d.volume for d in outs) < sum(d.volume for d in ins) - 1e-8:
+                continue  # still open, or only partly closed
             i, o = ins[0], outs[-1]
             out.append({
                 "ticket": pid, "pair": self._pair(i.symbol),
