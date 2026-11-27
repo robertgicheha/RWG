@@ -136,7 +136,10 @@ def create_app(root: Path | str = ROOT, token: str | None = None) -> FastAPI:
         last = cycles[-1] if cycles else {}
         errors = [e for e in journal.events(300, "ERROR")
                   if (_age(e["ts"]) or 1e9) < 86400]
+        model = _read_json(root / "data" / "fx_trend_model.json", {}) or {}
         return {
+            "model": {k: model.get(k) for k in ("trained_at", "changed_at", "failed_at", "reason",
+                                                "no_edge", "pending", "proposal", "params")},
             "bot": sup.status(), "snapshot": snap, "snapshot_age_s": _age(snap.get("ts")),
             "state": state, "last_cycle": last, "performance": perf,
             "errors_24h": len(errors),

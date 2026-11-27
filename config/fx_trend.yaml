@@ -50,6 +50,26 @@ fx_trend:
     max_spread_pips: 3.0
     max_lots_per_order: 1.0
 
+  autotrain:
+    # Monthly retraining. It can swap the entry/exit settings above (never risk_pct, the loss
+    # limits or the pairs). A replacement must make money on data it was NOT picked on, also at
+    # higher costs, AND picking settings this way must have made money out-of-sample.
+    # Run by hand (changes nothing in the bot): python scripts/train_fx_trend.py
+    enabled: true
+    every_days: 30
+    min_days_between_changes: 90
+    history_bars: 5000
+    auto_apply: true          # dry-run and demo accounts
+    auto_apply_live: false    # real money: new strategies are only proposed unless true
+    on_no_edge: pause         # nothing passes: stop opening trades (exits keep running). Or: keep
+    gates:
+      train_years: 6
+      validation_years: 2
+      min_validation_trades: 30
+      max_validation_drawdown_pct: 8.0
+      min_profit_factor: 1.05
+      min_sharpe_gain: 0.2
+
   schedule:
     # Daily bars close at the broker's rollover. Each poll is cheap: it refreshes
     # the dashboard snapshot and probes ONE bar; the full analysis only runs when

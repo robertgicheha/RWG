@@ -24,6 +24,31 @@ Portfolio backtest, 8 configured pairs, about 18 years, 0.5% risk, modelled cost
   factor was 1.10 at stop 2 (t = 0.8: not distinguishable from zero), 0.98 at double costs.
 - Doubling risk to 1% barely raised the return and about doubled the drawdown.
 
+## Automatic retraining (`autotrain:` in the config)
+Every 30 days the running bot downloads daily history and:
+1. Picks one challenger from 28 candidates (pullback, band reversion, Donchian breakout, trend;
+   some pullbacks with a volatility filter) using a 6-year train window.
+2. Tests the challenger and the current settings on the following 2 years, at normal and higher costs.
+3. Walk-forwards the whole picking method. If it lost money out-of-sample, nothing is promoted.
+
+| Decision | Effect |
+|---|---|
+| `promote` | New settings apply once the bot holds no positions (entries wait until then) |
+| `keep` | No change |
+| `no_edge` | Current settings fail and nothing replaces them: new entries pause, exits keep running |
+
+On a real-money account with orders on, promotion is only a proposal unless `auto_apply_live: true`.
+Results: `data/fx_trend_model.json`, the dashboard events list and `fx_trend.log`.
+A failed run changes nothing and is retried after 24 hours. To retrain now, delete the model file
+and restart (this also forgets any adopted settings). Editing `strategy:` also discards them.
+
+**First measured run (2026-11-27, `data/fx_daily`): `keep`.**
+- Current settings, 2024-11-25 to 2026-11-25: +4.3%, max drawdown -2.1%, PF 1.58, 86 trades.
+  This period is not truly unseen for them: they were chosen using all history.
+- Walk-forward of the picking method: **-23.0%**, PF 0.69, 3 of 13 years profitable.
+  Choosing recent winners has not worked, so promotion is currently blocked. It stays blocked
+  while this number is not positive. Passing the gates would still not promise profit.
+
 ## Circuit breakers (`risk:` in the config)
 - Every order carries a stop-loss. Gaps and slippage can make a loss larger than planned.
 - 4 losses in a row: 5-day pause, then half risk until a win.
@@ -41,6 +66,8 @@ Portfolio backtest, 8 configured pairs, about 18 years, 0.5% risk, modelled cost
 |---|---|
 | `strategy/fx_trend.py` | Pure strategy functions (signals, stops, sizing) |
 | `strategy/fx_trend_backtest.py` | Portfolio backtest with costs, risk gates, Monte Carlo |
+| `strategy/fx_autotrain.py` | Retraining and champion/challenger gates (pure) |
+| `core/fx_trend_autotrain.py` | Schedules retraining in the live bot and applies the decision |
 | `core/fx_trend_runner.py` | Live decision cycle (idempotent, once per closed daily bar) |
 | `core/fx_trend_broker.py` | MT5 adapter (own magic number only) |
 | `core/fx_trend_journal.py` | SQLite journal: cycles, signals, events, trades |

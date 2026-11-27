@@ -170,3 +170,31 @@ def test_idle_poll_does_not_download_history(tmp_path):
     n_after_first = len(calls)
     assert rn.run_once(NOW)["skipped"] == "already_processed"
     assert len(calls) == n_after_first      # second poll used only the 1-bar probe
+
+
+def test_blocked_terminal_sends_nothing_logs_once_then_resumes(tmp_path, caplog):
+    b = FakeBroker({"EURUSD": bars()})
+    reason = ["Algo Trading is OFF"]
+    b.trade_block_reason = lambda: reason[0]
+    rn = runner(tmp_path, b)
+    for _ in range(3):
+        assert rn.run_once(NOW)["skipped"] == "trading_blocked"
+    assert not b.opened
+    assert sum("orders blocked" in m for m in caplog.messages) == 1
+    reason[0] = None
+    rn.run_once(NOW)                       # same bar was not consumed
+    assert len(b.opened) == 1
+
+
+def test_locked_snapshot_does_not_stop_trade_sync(tmp_path, monkeypatch):
+    b = FakeBroker({"EURUSD": bars()})
+    rn = runner(tmp_path, b)
+    synced = []
+
+    def locked(now=None):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(rn, "snapshot", locked)
+    monkeypatch.setattr(rn, "sync_trades", lambda *a, **k: synced.append(1) or 0)
+    rn.tick(NOW)
+    assert synced

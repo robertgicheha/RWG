@@ -87,14 +87,19 @@ def _save(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2, default=str))
-    for attempt in range(5):
+    _replace(tmp, path)
+
+
+def _replace(tmp: Path, path: Path, attempts: int = 8) -> None:
+    """Atomic rename that waits out Windows locks (dashboard reading, antivirus scanning)."""
+    for attempt in range(attempts):
         try:
             tmp.replace(path)
             return
-        except PermissionError:      # Windows: a reader has the file open for a moment
-            if attempt == 4:
+        except PermissionError:
+            if attempt == attempts - 1:
                 raise
-            time.sleep(0.1)
+            time.sleep(min(0.1 * 2 ** attempt, 1.0))   # about 4.5s in total
 
 
 class FxTrendRunner:
@@ -106,6 +111,8 @@ class FxTrendRunner:
         self.journal = journal if journal is not None else Journal(self.base / cfg.journal_file)
         self._last_trade_sync: datetime | None = None
         self._halted = False
+        self._blocked: str | None = None
+        self.entry_hold: str | None = None   # why new entries are on hold (exits still run)
 
     # ------------------------------------------------------------------
     def _event(self, kind: str, msg: str, pair: str = "", level: str = "INFO") -> None:
@@ -120,11 +127,14 @@ class FxTrendRunner:
         self.notify(tag + msg)
         self._event(kind, tag + msg, pair)
 
-    def _flatten(self, reason: str) -> None:
+    def _flatten(self, reason: str) -> list[str]:
+        """Close everything this bot owns. Returns the pairs that could NOT be closed."""
+        failed = []
         for pos in self.broker.positions():
             self._act("close", pos.pair, f"CLOSE {pos.pair} ({reason})")
-            if not self.cfg.dry_run:
-                self.broker.close(pos)
+            if not self.cfg.dry_run and not self.broker.close(pos):
+                failed.append(pos.pair)
+        return failed
 
     # ------------------------------------------------------------------
     def snapshot(self, now: datetime | None = None) -> dict:
@@ -197,9 +207,11 @@ class FxTrendRunner:
         now = now or datetime.now(timezone.utc)
         try:
             self.snapshot(now)
-            self.sync_trades(now)
+        except PermissionError as e:   # only the dashboard view is stale; the next poll rewrites it
+            logger.warning("snapshot not written, file locked: %s", e)
         except Exception:
-            logger.exception("snapshot/sync failed")
+            logger.exception("snapshot failed")
+        self.sync_trades(now)          # handles its own errors
         return self.run_once(now)
 
     def _write_candles(self, inds: dict, n: int = 150) -> None:
@@ -216,7 +228,7 @@ class FxTrendRunner:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(out))
-            tmp.replace(path)
+            _replace(tmp, path)
         except Exception:
             logger.exception("candle export failed")
 
@@ -252,6 +264,19 @@ class FxTrendRunner:
         summary["skipped"] = why
         return summary
 
+    def _trading_blocked(self) -> str | None:
+        """Why MT5 would reject every order right now. Reported once per change, not every poll."""
+        check = getattr(self.broker, "trade_block_reason", None)
+        why = check() if check and not self.cfg.dry_run else None
+        if why != self._blocked:
+            self._blocked = why
+            msg = (f"orders blocked: {why}. No orders sent; retrying each poll."
+                   if why else "orders no longer blocked, trading resumes")
+            logger.log(logging.ERROR if why else logging.INFO, msg)
+            self.notify("FX trend bot: " + msg)
+            self._event("order", msg, level="ERROR" if why else "INFO")
+        return why
+
     # ------------------------------------------------------------------
     def run_once(self, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
@@ -262,7 +287,14 @@ class FxTrendRunner:
 
         # ---- kill switch -------------------------------------------------
         if (self.base / cfg.kill_file).exists():
-            self._flatten("KILL SWITCH")
+            failed = self._flatten("KILL SWITCH")
+            if failed:       # keep running so the next poll tries again
+                msg = f"KILL SWITCH INCOMPLETE: still open {failed}. Retrying; check MT5."
+                logger.error(msg)
+                self._event("kill", msg, level="ERROR")
+                self.notify("FX trend bot: " + msg)
+                summary["skipped"] = "kill_incomplete"
+                return summary
             self._event("kill", "Kill switch active: flattened and stopped.", level="WARNING")
             self.notify("FX trend bot: kill switch active, flattened and stopped.")
             summary["skipped"] = "kill_switch"
@@ -274,6 +306,10 @@ class FxTrendRunner:
         probe = self.broker.latest_bar_date(cfg.pairs[0]) if cfg.pairs else None
         if probe and probe == state.get("last_bar"):
             summary["skipped"] = "already_processed"
+            return summary
+
+        if self._trading_blocked():
+            summary["skipped"] = "trading_blocked"   # last_bar untouched: the bar is not consumed
             return summary
 
         # ---- data --------------------------------------------------------
@@ -342,6 +378,8 @@ class FxTrendRunner:
             why_halted = f"pausing {limits.pause_days}d after {streak} losses in a row"
         elif not history_ok and (limits.max_consecutive_losses or limits.pause_after_losses):
             why_halted = "trade history unreadable, cannot check the losing streak"
+        if why_halted is None:
+            why_halted = self.entry_hold      # set by the auto-retrainer
         risk_pct = p.risk_pct * risk_multiplier(streak, limits)
         halted = why_halted is not None
         self._halted = halted

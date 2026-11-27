@@ -22,6 +22,7 @@ import logging.handlers
 import os
 import sys
 import time
+from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,10 +31,13 @@ import yaml
 ROOT = Path(__file__).parent.parent
 sys.path.append(str(ROOT))
 
+from core.fx_trend_autotrain import AutoTrainConfig, AutoTrainer
 from core.fx_trend_broker import MT5Broker
 from core.fx_trend_runner import FxTrendRunner, RunnerConfig
 from core.fx_trend_supervisor import pid_alive
+from strategy.fx_autotrain import TrainSettings
 from strategy.fx_trend import TrendParams
+from strategy.fx_trend_backtest import BtConfig
 
 log = logging.getLogger("fx_trend_bot")
 
@@ -124,18 +128,6 @@ def main():
         login=int(os.environ.get("MT5_LOGIN", "0") or 0),
         password=os.environ.get("MT5_PASSWORD", ""), server=os.environ.get("MT5_SERVER", ""),
         terminal_path=os.environ.get("MT5_TERMINAL_PATH", ""))
-    if not broker.connect():
-        log.error("MT5 connection failed.")
-        sys.exit("MT5 connection failed.")
-
-    notify = make_notifier()
-    if not cfg.dry_run and not broker.is_demo():
-        if not (args.allow_live and args.i_understand_the_risk):
-            log.error("REFUSING to send orders on a LIVE account.")
-            sys.exit("REFUSING to send orders on a LIVE account. Validate on demo for 2-3 months first; "
-                     "then pass --allow-live --i-understand-the-risk.")
-        notify("WARNING: running with REAL MONEY.")
-
     stop_file, kill_file = ROOT / "data" / "fx_trend.STOP", ROOT / cfg.kill_file
     pid_file, hb = ROOT / "data" / "fx_trend.pid", ROOT / sch["heartbeat_file"]
     pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -149,12 +141,32 @@ def main():
         msg = (f"Bot already running (pid {other}). Not starting a second copy. "
                f"Use the dashboard Control tab to stop/restart it, or tail data\\logs\\fx_trend.log.")
         log.error(msg)
-        broker.shutdown()
         sys.exit(msg)
+    # Claim the slot BEFORE connecting: connect can retry for minutes, and a second copy
+    # started meanwhile must be turned away.
     pid_file.write_text(str(os.getpid()))
     stop_file.unlink(missing_ok=True)
 
+    if not broker.connect():
+        pid_file.unlink(missing_ok=True)
+        log.error("MT5 connection failed.")
+        sys.exit("MT5 connection failed.")
+
+    notify = make_notifier()
+    if not cfg.dry_run and not broker.is_demo():
+        if not (args.allow_live and args.i_understand_the_risk):
+            pid_file.unlink(missing_ok=True)
+            log.error("REFUSING to send orders on a LIVE account.")
+            sys.exit("REFUSING to send orders on a LIVE account. Validate on demo for 2-3 months first; "
+                     "then pass --allow-live --i-understand-the-risk.")
+        notify("WARNING: running with REAL MONEY.")
+
     runner = FxTrendRunner(broker, cfg, notify=notify, base_dir=ROOT)
+    auto = dict(y.get("autotrain") or {})
+    gates = TrainSettings(**auto.pop("gates", {}))
+    bt_risk = {k: v for k, v in rk.items() if k in {f.name for f in fields(BtConfig)}}
+    trainer = AutoTrainer(runner, AutoTrainConfig(settings=gates, **auto), BtConfig(**bt_risk),
+                          background=not args.once)
     msg = f"started ({'DRY-RUN' if cfg.dry_run else 'ORDERS ENABLED'}), pairs={cfg.pairs}"
     log.info(msg)
     notify(msg)
@@ -165,6 +177,7 @@ def main():
                 log.info("STOP file found: exiting, positions left open.")
                 runner._event("lifecycle", "graceful stop requested, positions left open")
                 break
+            trainer.poll(datetime.now(timezone.utc))
             try:
                 result = runner.tick()
             except Exception as e:  # never die silently, never die from one bad cycle

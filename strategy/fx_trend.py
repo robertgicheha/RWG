@@ -24,6 +24,9 @@ import numpy as np
 import pandas as pd
 
 
+STYLES = ("trend", "pullback", "breakout", "band")
+
+
 @dataclass(frozen=True)
 class TrendParams:
     sma_len: int = 100
@@ -45,9 +48,21 @@ class TrendParams:
     rsi_entry: float = 5.0
     exit_sma_len: int = 5
     max_hold_days: int = 0               # leave after N closed daily bars (0 = no time limit)
+    # "breakout" = Donchian channel: buy a close above the previous breakout_len closes,
+    # leave on a close beyond the previous breakout_exit_len closes the other way.
+    breakout_len: int = 55
+    breakout_exit_len: int = 20
+    # "band" = inside the SMA(sma_len) trend, buy a close band_k standard deviations below
+    # the band_len mean (mirrored for shorts); leave when price is back at that mean.
+    band_len: int = 20
+    band_k: float = 2.0
+    # Volatility regime filter, any style: no entry when ATR is above this multiple of its
+    # own vol_len median (0 = off).
+    max_vol_ratio: float = 0.0
+    vol_len: int = 100
 
     def __post_init__(self):
-        if self.style not in ("trend", "pullback"):
+        if self.style not in STYLES:
             raise ValueError(f"unknown strategy style {self.style!r}")
 
     @property
@@ -57,7 +72,14 @@ class TrendParams:
 
     @property
     def warmup(self) -> int:
-        return max(self.sma_len, self.mom_len, self.atr_len) + 1
+        need = [self.sma_len, self.mom_len, self.atr_len]
+        if self.style == "breakout":
+            need += [self.breakout_len, self.breakout_exit_len]
+        if self.style == "band":
+            need.append(self.band_len)
+        if self.max_vol_ratio:
+            need.append(self.atr_len + self.vol_len)
+        return max(need) + 1
 
 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
@@ -102,16 +124,36 @@ def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.D
         exit_sma = out["close"].rolling(p.exit_sma_len, min_periods=p.exit_sma_len).mean()
         long_ = (out["close"] > out["sma"]) & (out["rsi"] < p.rsi_entry)
         short_ = (out["close"] < out["sma"]) & (out["rsi"] > 100.0 - p.rsi_entry) if p.allow_short else False
+    elif p.style == "breakout":
+        close, prior = out["close"], out["close"].shift(1)
+        long_ = close > prior.rolling(p.breakout_len).max()
+        short_ = close < prior.rolling(p.breakout_len).min() if p.allow_short else False
+        exit_low = prior.rolling(p.breakout_exit_len).min()
+        exit_high = prior.rolling(p.breakout_exit_len).max()
+    elif p.style == "band":
+        mid = out["close"].rolling(p.band_len).mean()
+        width = p.band_k * out["close"].rolling(p.band_len).std()
+        long_ = (out["close"] > out["sma"]) & (out["close"] < mid - width)
+        short_ = (out["close"] < out["sma"]) & (out["close"] > mid + width) if p.allow_short else False
     sig = np.where(long_, 1, np.where(short_, -1, 0))
     out["signal"] = pd.Series(sig, index=out.index).where(ready, 0).astype(int)
     if p.style == "pullback":
         out["exit_long"] = out["close"] > exit_sma
         out["exit_short"] = out["close"] < exit_sma
+    elif p.style == "breakout":
+        out["exit_long"] = out["close"] < exit_low
+        out["exit_short"] = out["close"] > exit_high
+    elif p.style == "band":
+        out["exit_long"] = out["close"] > mid
+        out["exit_short"] = out["close"] < mid
     else:
         out["exit_long"] = out["signal"] != 1
         out["exit_short"] = out["signal"] != -1
     out["strength"] = (out["close"] - out["sma"]) / out["atr"]
     out["entry_ok"] = (out["signal"] != 0) & (out["strength"].abs() >= p.min_entry_strength_atr)
+    if p.max_vol_ratio:     # not enough history to judge volatility = no entry
+        calm = out["atr"] <= p.max_vol_ratio * out["atr"].rolling(p.vol_len).median()
+        out["entry_ok"] = out["entry_ok"] & calm
     return out
 
 

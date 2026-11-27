@@ -117,6 +117,20 @@ class MT5Broker:
         info = mt5.account_info()
         return bool(info) and getattr(info, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0)
 
+    def trade_block_reason(self) -> str | None:
+        """None if orders can be sent, else what has to be switched on."""
+        mt5 = get_mt5()
+        term, acct = mt5.terminal_info(), mt5.account_info()
+        if not term or not acct:
+            return "MT5 terminal or account not reachable"
+        if not term.trade_allowed:
+            return f"Algo Trading is OFF in the terminal at {term.path} (click the 'Algo Trading' toolbar button)"
+        if not acct.trade_allowed:
+            return "trading is disabled for this account (logged in with the investor password?)"
+        if not acct.trade_expert:
+            return "the broker has disabled automated trading for this account"
+        return None
+
     def equity(self) -> float:
         info = get_mt5().account_info()
         return float(info.equity) if info else 0.0
@@ -180,6 +194,7 @@ class MT5Broker:
         mt5.symbol_select(sym, True)
         rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_D1, 1, n)
         if rates is None or len(rates) == 0:
+            logger.warning("no daily bars for %s: %s", sym, mt5.last_error())
             return pd.DataFrame(columns=["open", "high", "low", "close"])
         df = pd.DataFrame(rates)
         df.index = pd.to_datetime(df["time"], unit="s").dt.normalize()
